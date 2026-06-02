@@ -51,8 +51,6 @@ LIMIT_GIF        = 30
 STATE_KEY = "mode"
 LOCK_KEY  = "lock"
 
-BUTTON_STOP = "🛑 Остановить"
-
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -88,7 +86,7 @@ MODES: dict[int, Mode] = {
         output_ext=".mp4",
         limit=LIMIT_VIDEO_NOTE,
         valid_types=frozenset({"video", "video_note", "animation"}),
-        error="❌ Этот файл не подходит для создания кружка.",
+        error="❌ Для кружка нужно видео или GIF — отправьте подходящий файл.",
     ),
     MODE_TO_VOICE: Mode(
         command="tovoice",
@@ -98,7 +96,7 @@ MODES: dict[int, Mode] = {
         output_ext=".ogg",
         limit=LIMIT_AUDIO,
         valid_types=frozenset({"audio", "video", "video_note", "animation", "audio_doc"}),
-        error="❌ Этот файл не подходит для создания голосового.",
+        error="❌ Для голосового нужно аудио или видео — отправьте подходящий файл.",
     ),
     MODE_EXTRACT_AUDIO: Mode(
         command="extractaudio",
@@ -108,7 +106,7 @@ MODES: dict[int, Mode] = {
         output_ext=".mp3",
         limit=LIMIT_AUDIO,
         valid_types=frozenset({"video", "video_note", "voice", "animation"}),
-        error="❌ Этот файл не подходит для извлечения аудио.",
+        error="❌ Для извлечения аудио нужно видео или голосовое — отправьте подходящий файл.",
     ),
     MODE_TO_GIF: Mode(
         command="togif",
@@ -118,7 +116,7 @@ MODES: dict[int, Mode] = {
         output_ext=".gif",
         limit=LIMIT_GIF,
         valid_types=frozenset({"video", "video_note", "animation"}),
-        error="❌ Этот файл не подходит для создания GIF.",
+        error="❌ Для GIF нужно видео — отправьте подходящий файл.",
     ),
 }
 
@@ -126,7 +124,6 @@ BUTTON_TO_MODE = {m.button: mid for mid, m in MODES.items()}
 KEYBOARD = [
     [MODES[MODE_VIDEO_NOTE].button, MODES[MODE_EXTRACT_AUDIO].button],
     [MODES[MODE_TO_VOICE].button,   MODES[MODE_TO_GIF].button],
-    [BUTTON_STOP],
 ]
 
 # Семафор для ffmpeg создаётся лениво — внутри работающего event loop.
@@ -166,6 +163,7 @@ def pick_file(message):
     if message.animation:  return message.animation,  "animation"   # GIF приходит как animation
     if message.audio:      return message.audio,      "audio"
     if message.voice:      return message.voice,      "voice"
+    if message.photo:      return message.photo[-1],  "photo"        # фото → как медиа (неподходящий тип)
     if message.document:
         mime = (message.document.mime_type or "").lower()
         if mime.startswith("audio/"): return message.document, "audio_doc"
@@ -209,7 +207,7 @@ def read_progress_ratio(path: str, total: float) -> Optional[float]:
     return None
 
 
-def progress_bar(pct: int, width: int = 12) -> str:
+def progress_bar(pct: int, width: int = 10) -> str:
     filled = max(0, min(width, round(pct / 100 * width)))
     return "▓" * filled + "░" * (width - filled)
 
@@ -236,7 +234,7 @@ async def progress_loop(status_msg, base: str, path: str, total: float,
         if ratio is None:
             continue
         pct = max(0, min(99, int(ratio * 100)))
-        line = f"{base}… {progress_bar(pct)} {pct}%"
+        line = f"{base}…\n{progress_bar(pct)} {pct}%"
         if ratio > 0.03:                            # ETA — только когда есть осмысленный сигнал
             elapsed = time.monotonic() - start
             line += f" · осталось {format_eta(elapsed * (1 - ratio) / ratio)}"
@@ -407,37 +405,50 @@ async def run_conversion(update, context, file_ref, mode, file_type, reply_to, s
 
 # --- ХЭНДЛЕРЫ ---
 
+GROUP_REPLY_NOTE = (
+    "\n\n📎 В группе пришлите файл ответом (reply) на это сообщение бота — "
+    "иначе из-за настроек приватности бот его не получит."
+)
+
+
+def with_group_note(text: str, chat) -> str:
+    """В группе добавляет примечание: файл нужно слать ответом на сообщение бота."""
+    if chat.type in ("group", "supergroup"):
+        return text + GROUP_REPLY_NOTE
+    return text
+
+
+async def prompt_send_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Реакция на текст/стикер: просим файл (если режим выбран) или выбрать действие."""
+    if context.user_data.get(STATE_KEY) is not None:
+        await update.message.reply_text("📎 Отправьте медиафайл — текст и стикеры я не конвертирую.")
+    else:
+        await update.message.reply_text("⚠️ Сначала выберите режим в меню и отправьте медиафайл.")
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = "👋 Привет! Выберите действие и отправляйте файлы — можно несколько подряд."
     await update.message.reply_text(
-        "👋 Привет! Выберите действие и отправляйте файлы — можно несколько подряд.\n"
-        "Чтобы сбросить выбор, нажмите «🛑 Остановить» или /stop.",
+        with_group_note(text, update.effective_chat),
         reply_markup=ReplyKeyboardMarkup(KEYBOARD, resize_keyboard=True),
     )
-
-
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data.pop(STATE_KEY, None)
-    await update.message.reply_text("🛑 Остановлено. Выберите действие в меню, когда понадобится.")
 
 
 def make_mode_command(mode: int):
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data[STATE_KEY] = mode
-        await update.message.reply_text(MODES[mode].prompt)
+        await update.message.reply_text(with_group_note(MODES[mode].prompt, update.effective_chat))
     return handler
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text
-    if text == BUTTON_STOP:
-        await cmd_stop(update, context)
+    mode = BUTTON_TO_MODE.get(update.message.text)
+    if mode is not None:
+        context.user_data[STATE_KEY] = mode
+        await update.message.reply_text(MODES[mode].prompt)
         return
-    mode = BUTTON_TO_MODE.get(text)
-    if mode is None:
-        await update.message.reply_text("Выберите команду из меню.")
-        return
-    context.user_data[STATE_KEY] = mode
-    await update.message.reply_text(MODES[mode].prompt)
+    # не кнопка — обычный текст
+    await prompt_send_file(update, context)
 
 
 async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -449,7 +460,7 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     mode = context.user_data.get(STATE_KEY)
     if mode is None:
         if update.effective_chat.type == "private":
-            await message.reply_text("⚠️ Сначала выберите действие в меню.")
+            await message.reply_text("⚠️ Сначала выберите режим в меню.")
         return
 
     if file_type not in MODES[mode].valid_types:
@@ -477,6 +488,10 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await run_conversion(update, context, file_ref, mode, file_type, message.message_id, status)
 
 
+async def on_unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Неизвестная команда. Выберите действие в меню.")
+
+
 # --- ЗАПУСК ---
 
 def main():
@@ -500,7 +515,6 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("stop", cmd_stop))
     for mode_id, cfg in MODES.items():
         app.add_handler(CommandHandler(cfg.command, make_mode_command(mode_id)))
 
@@ -509,11 +523,23 @@ def main():
         on_text,
     ))
 
+    # Стикеры (как и текст) — не файлы: просим прислать файл / выбрать режим.
+    app.add_handler(MessageHandler(
+        filters.Sticker.ALL & filters.ChatType.PRIVATE,
+        prompt_send_file,
+    ))
+
     media_filter = (
-        filters.VIDEO | filters.AUDIO | filters.VOICE |
-        filters.VIDEO_NOTE | filters.ANIMATION | filters.Document.ALL
+        filters.VIDEO | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE |
+        filters.ANIMATION | filters.PHOTO | filters.Document.ALL
     )
     app.add_handler(MessageHandler(media_filter, on_media))
+
+    # Неизвестные команды — регистрируем после всех конкретных, только в личке.
+    app.add_handler(MessageHandler(
+        filters.COMMAND & filters.ChatType.PRIVATE,
+        on_unknown_command,
+    ))
 
     app.run_polling(drop_pending_updates=True)
 
