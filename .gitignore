@@ -1,5 +1,6 @@
 # Секреты — НИКОГДА не коммитить
 .env
+/local_test/
 
 # Python
 __pycache__/
