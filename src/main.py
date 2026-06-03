@@ -48,6 +48,8 @@ LIMIT_VIDEO_NOTE = 60
 LIMIT_AUDIO      = 300
 LIMIT_GIF        = 30
 
+VIDEO_NOTE_SIZE  = 512                       # сторона кружка (px); Telegram показывает его кругом
+
 STATE_KEY = "mode"
 LOCK_KEY  = "lock"
 
@@ -75,28 +77,34 @@ class Mode:
     limit: int                                   # потолок длительности (для прогресса)
     valid_types: frozenset = field(default_factory=frozenset)
     error: str = "❌ Неподходящий файл."
+    same_type: Optional[str] = None              # тип входа, который уже является результатом
+    same_type_error: str = ""                    # сообщение для случая «уже такой формат»
 
 
 MODES: dict[int, Mode] = {
     MODE_VIDEO_NOTE: Mode(
         command="videonote",
         button="🎬 Сделать кружок (видео/GIF)",
-        prompt="🎬 Отправьте видео или GIF (до 1 мин). Можно слать несколько подряд.",
+        prompt="🎬 Отправьте видео или GIF. Можно слать несколько подряд.\n⚠️ Видео длиннее 1 минуты обрежется до 1 минуты автоматически.",
         status="🎬 Создаю кружок",
         output_ext=".mp4",
         limit=LIMIT_VIDEO_NOTE,
         valid_types=frozenset({"video", "video_note", "animation"}),
         error="❌ Для кружка нужно видео или GIF — отправьте подходящий файл.",
+        same_type="video_note",
+        same_type_error="🔁 Это уже кружок — конвертировать не нужно.",
     ),
     MODE_TO_VOICE: Mode(
         command="tovoice",
-        button="🎵 Конвертировать в ГС (MP3/видео)",
+        button="🎵 Конвертировать в ГС (аудио/видео)",
         prompt="🎵 Отправьте аудио или видео. Можно слать несколько подряд.",
         status="🎵 Конвертирую в ГС",
         output_ext=".ogg",
         limit=LIMIT_AUDIO,
         valid_types=frozenset({"audio", "video", "video_note", "animation", "audio_doc"}),
         error="❌ Для голосового нужно аудио или видео — отправьте подходящий файл.",
+        same_type="voice",
+        same_type_error="🔁 Это уже голосовое сообщение.",
     ),
     MODE_EXTRACT_AUDIO: Mode(
         command="extractaudio",
@@ -117,6 +125,8 @@ MODES: dict[int, Mode] = {
         limit=LIMIT_GIF,
         valid_types=frozenset({"video", "video_note", "animation"}),
         error="❌ Для GIF нужно видео — отправьте подходящий файл.",
+        same_type="animation",
+        same_type_error="🔁 Это уже GIF.",
     ),
 }
 
@@ -125,6 +135,9 @@ KEYBOARD = [
     [MODES[MODE_VIDEO_NOTE].button, MODES[MODE_EXTRACT_AUDIO].button],
     [MODES[MODE_TO_VOICE].button,   MODES[MODE_TO_GIF].button],
 ]
+
+# Режимы, которым на выходе нужен звук — для них проверяем наличие аудиодорожки.
+AUDIO_OUTPUT_MODES = frozenset({MODE_TO_VOICE, MODE_EXTRACT_AUDIO})
 
 # Семафор для ffmpeg создаётся лениво — внутри работающего event loop.
 _ffmpeg_sem: Optional[asyncio.Semaphore] = None
@@ -156,6 +169,13 @@ def guess_extension(message, file_type: str) -> str:
     return ".mp3" if file_type in ("audio", "audio_doc") else ".bin"
 
 
+# Расширения, по которым опознаём видео/аудио, присланные как «документ».
+VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv",
+              ".m4v", ".mpg", ".mpeg", ".3gp", ".ts", ".m2ts", ".ogv"}
+AUDIO_EXTS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".oga", ".opus",
+              ".m4a", ".wma", ".aiff", ".aif", ".alac", ".ape", ".wv"}
+
+
 def pick_file(message):
     """Возвращает (объект файла, тип) или (None, None)."""
     if message.video:      return message.video,      "video"
@@ -166,8 +186,13 @@ def pick_file(message):
     if message.photo:      return message.photo[-1],  "photo"        # фото → как медиа (неподходящий тип)
     if message.document:
         mime = (message.document.mime_type or "").lower()
-        if mime.startswith("audio/"): return message.document, "audio_doc"
-        if mime.startswith("video/"): return message.document, "video"
+        ext  = os.path.splitext(message.document.file_name or "")[1].lower()
+        # Многие форматы Telegram шлёт как «документ» с mime application/octet-stream —
+        # тогда ориентируемся на расширение файла.
+        if mime.startswith("audio/") or ext in AUDIO_EXTS:
+            return message.document, "audio_doc"
+        if mime.startswith("video/") or ext in VIDEO_EXTS:
+            return message.document, "video"
         return message.document, "document"
     return None, None
 
@@ -180,6 +205,15 @@ def probe_duration(src: str) -> Optional[float]:
         return float(dur) if dur else None
     except Exception:
         return None
+
+
+def has_audio_stream(src: str) -> bool:
+    """True, если в файле есть звуковая дорожка (для аудио-режимов)."""
+    try:
+        info = ffmpeg.probe(src)
+        return any(s.get("codec_type") == "audio" for s in info.get("streams", []))
+    except Exception:
+        return True   # не смогли проверить — не блокируем, пусть решает ffmpeg
 
 
 def _parse_timestamp(ts: str) -> Optional[float]:
@@ -256,21 +290,23 @@ def build_video_note(src: str, dst: str):
     if not video:
         raise ValueError("Видеопоток не найден.")
 
-    side = min(int(video.get("width", 360)), int(video.get("height", 360)))
+    side = min(int(video.get("width", VIDEO_NOTE_SIZE)), int(video.get("height", VIDEO_NOTE_SIZE)))
     inp = ffmpeg.input(src, t=LIMIT_VIDEO_NOTE)
-    v = inp["v:0"].filter("crop", side, side).filter("scale", 360, 360)
+    v = (inp["v:0"]
+         .filter("crop", side, side)
+         .filter("scale", VIDEO_NOTE_SIZE, VIDEO_NOTE_SIZE, flags="lanczos"))
 
     params = {
         "vcodec": "libx264",
         "pix_fmt": "yuv420p",          # совместимость со всеми плеерами
-        "b:v": "1M",
-        "tune": "zerolatency",
+        "crf": 23,                     # качество по CRF (меньше — лучше) вместо фиксированного битрейта
         "preset": "veryfast",
         "movflags": "+faststart",      # moov-атом в начало → быстрый старт воспроизведения
         "format": "mp4",
     }
     if has_audio:
-        return ffmpeg.output(v, inp["a:0"], dst, acodec="aac", **params)
+        return ffmpeg.output(v, inp["a:0"], dst, acodec="aac",
+                             **{"b:a": "128k"}, **params)
     return ffmpeg.output(v, dst, an=None, **params)
 
 
@@ -322,7 +358,7 @@ async def send_result(bot, chat_id, mode, path, ext, reply_to):
     with open(path, "rb") as fh:
         media = InputFile(fh, filename=f"result{ext}")
         if mode == MODE_VIDEO_NOTE:
-            await bot.send_video_note(chat_id, video_note=media, length=360, **kwargs)
+            await bot.send_video_note(chat_id, video_note=media, length=VIDEO_NOTE_SIZE, **kwargs)
         elif mode == MODE_TO_VOICE:
             await bot.send_voice(chat_id, voice=media, **kwargs)
         elif mode == MODE_EXTRACT_AUDIO:
@@ -354,6 +390,11 @@ async def run_conversion(update, context, file_ref, mode, file_type, reply_to, s
         await tg_file.download_to_drive(
             src, read_timeout=180, write_timeout=180, connect_timeout=180
         )
+
+        # Если режим даёт аудио, а звуковой дорожки нет — понятное сообщение вместо ошибки формата.
+        if mode in AUDIO_OUTPUT_MODES and not has_audio_stream(src):
+            await status.edit_text("❌ В этом файле нет звука — обрабатывать нечего.")
+            return
 
         # Сколько секунд реально обрабатываем (с учётом потолка режима) — для процентов.
         real = probe_duration(src)
@@ -461,6 +502,10 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if mode is None:
         if update.effective_chat.type == "private":
             await message.reply_text("⚠️ Сначала выберите режим в меню.")
+        return
+
+    if file_type == MODES[mode].same_type:
+        await message.reply_text(MODES[mode].same_type_error)
         return
 
     if file_type not in MODES[mode].valid_types:
