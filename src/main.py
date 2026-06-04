@@ -1,12 +1,12 @@
 """
 Telegram-бот для конвертации медиа:
-  • видео/GIF  → видео-кружок (video note), с выбором области кадра
+  • видео/GIF   → видео-кружок (с выбором области кадра: сверху/центр/снизу/слева/справа)
   • аудио/видео → голосовое сообщение (ogg/opus)
-  • видео/ГС   → извлечение аудио (mp3)
-  • видео/кружок → GIF, с выбором временного отрезка (до 30 сек)
+  • видео/кружок → извлечение аудио (mp3)
+  • видео/кружок → GIF (с выбором временного отрезка, по одному файлу за раз)
 
-Версия 2.0.0 — меню по категориям (Видео/Аудио), выбор области кадра для кружка,
-выбор отрезка для GIF. Управление файлами и обработчики ситуаций сохранены из 1.x.
+Версия 2.1.0 — нижнее меню по категориям с навигацией, области кадра слева/справа,
+GIF по одному файлу, устойчивость к «тяжёлым» файлам (айфон HEVC/HDR), таймаут конвертации.
 """
 
 import asyncio
@@ -25,13 +25,11 @@ from telegram import (
     Update,
     InputFile,
     ReplyKeyboardMarkup,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
+    ReplyParameters,
 )
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
@@ -44,31 +42,31 @@ except ModuleNotFoundError:
     load_dotenv = None
 
 # --- НАСТРОЙКИ ---
-# Токен берётся из файла .env рядом со скриптом или из переменной окружения.
-# В самом коде токена быть не должно.
 if load_dotenv is not None:
     load_dotenv(Path(__file__).with_name(".env"))
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 MAX_DOWNLOAD_SIZE     = 20 * 1024 * 1024     # лимит Telegram на скачивание ботом (~20 МБ)
-MAX_CONCURRENT_FFMPEG = 3                    # сколько ffmpeg-задач крутить одновременно (на всех)
-PROGRESS_INTERVAL     = 2.0                  # как часто обновлять прогресс в сообщении (сек)
+MAX_CONCURRENT_FFMPEG = 3                    # сколько ffmpeg-задач одновременно (на всех)
+PROGRESS_INTERVAL     = 2.0                  # как часто обновлять прогресс (сек)
+CONVERSION_TIMEOUT    = 240                  # потолок на одну операцию ffmpeg (сек) — защита от зависаний
 
 # Ограничения длительности на входе (сек)
 LIMIT_VIDEO_NOTE = 60
 LIMIT_AUDIO      = 300
 LIMIT_GIF        = 30
 
-VIDEO_NOTE_SIZE  = 512                       # сторона кружка (px); Telegram показывает его кругом
+VIDEO_NOTE_SIZE  = 512                       # сторона кружка (px)
+VIDEO_NOTE_FPS   = 30                        # фикс. частота кадров кружка (60 fps с айфона вдвое тяжелее)
 
 # Ключи в user_data
 STATE_KEY   = "mode"                         # текущий режим
-CROP_KEY    = "crop"                         # область кадра для кружка: top / center / bottom
+CROP_KEY    = "crop"                         # область кадра кружка
 PENDING_KEY = "pending_gif"                  # видео, ожидающее ввода отрезка для GIF
+GROUP_KEY   = "gif_group"                    # media_group_id, про который уже сказали «один за раз»
+MENU_KEY    = "menu"                         # текущий уровень меню (для кнопки «Назад»)
 LOCK_KEY    = "lock"                         # пер-юзер очередь обработки
-
-MENU_BUTTON = "☰ Меню"                       # постоянная кнопка снизу
 
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(
@@ -87,15 +85,15 @@ MODE_VIDEO_NOTE, MODE_TO_VOICE, MODE_EXTRACT_AUDIO, MODE_TO_GIF = range(1, 5)
 @dataclass(frozen=True)
 class Mode:
     command: str
-    title: str                                   # короткое название для подтверждений
+    title: str
     prompt: str
     status: str
     output_ext: str
-    limit: int                                   # потолок длительности (для прогресса)
+    limit: int
     valid_types: frozenset = field(default_factory=frozenset)
     error: str = "❌ Неподходящий файл."
-    same_type: Optional[str] = None              # тип входа, который уже является результатом
-    same_type_error: str = ""                    # сообщение для случая «уже такой формат»
+    same_types: frozenset = field(default_factory=frozenset)   # типы, которые уже являются результатом
+    same_type_error: str = ""
 
 
 MODES: "dict[int, Mode]" = {
@@ -109,7 +107,7 @@ MODES: "dict[int, Mode]" = {
         limit=LIMIT_VIDEO_NOTE,
         valid_types=frozenset({"video", "animation"}),
         error="❌ Для кружка нужно видео или GIF — отправьте подходящий файл.",
-        same_type="video_note",
+        same_types=frozenset({"video_note"}),
         same_type_error="🔁 Это уже кружок — конвертировать не нужно.",
     ),
     MODE_TO_VOICE: Mode(
@@ -119,93 +117,69 @@ MODES: "dict[int, Mode]" = {
         status="🎵 Конвертирую в голосовое",
         output_ext=".ogg",
         limit=LIMIT_AUDIO,
-        valid_types=frozenset({"audio", "video", "video_note", "animation", "audio_doc"}),
+        valid_types=frozenset({"audio", "video", "video_note", "audio_doc"}),
         error="❌ Для голосового нужно аудио или видео — отправьте подходящий файл.",
-        same_type="voice",
+        same_types=frozenset({"voice"}),
         same_type_error="🔁 Это уже голосовое сообщение.",
     ),
     MODE_EXTRACT_AUDIO: Mode(
         command="extractaudio",
         title="извлечение аудио",
-        prompt="🎶 Пришлите видео или голосовое — можно несколько подряд.",
+        prompt="🎶 Пришлите видео или кружок — можно несколько подряд.",
         status="🎶 Извлекаю аудио",
         output_ext=".mp3",
         limit=LIMIT_AUDIO,
-        valid_types=frozenset({"video", "video_note", "voice", "animation"}),
-        error="❌ Для извлечения аудио нужно видео или голосовое — отправьте подходящий файл.",
+        valid_types=frozenset({"video", "video_note"}),
+        error="❌ Для извлечения аудио нужно видео или кружок — отправьте подходящий файл.",
+        same_types=frozenset({"audio", "voice", "audio_doc"}),
+        same_type_error="🔁 Это уже аудио — извлекать не нужно.",
     ),
     MODE_TO_GIF: Mode(
         command="togif",
         title="GIF",
-        prompt="🖼️ Пришлите видео или кружок — потом выберите отрезок (или «Всё»).",
+        prompt="🖼️ Пришлите видео или кружок (за раз — один файл), "
+               "затем укажете отрезок или нажмёте «Всё».",
         status="🖼️ Создаю GIF",
         output_ext=".gif",
         limit=LIMIT_GIF,
         valid_types=frozenset({"video", "video_note"}),
         error="❌ Для GIF нужно видео или кружок — отправьте подходящий файл.",
-        same_type="animation",
+        same_types=frozenset({"animation"}),
         same_type_error="🔁 Это уже GIF.",
     ),
 }
 
-# Режимы, которым на выходе нужен звук — для них проверяем наличие аудиодорожки.
 AUDIO_OUTPUT_MODES = frozenset({MODE_TO_VOICE, MODE_EXTRACT_AUDIO})
-
 COMMAND_TO_MODE = {m.command: mid for mid, m in MODES.items()}
 
-
-# --- МЕНЮ ПО КАТЕГОРИЯМ ---
-# Категория → (подпись, список режимов)
-CATEGORIES = {
-    "video": ("🎬 Видео", [MODE_VIDEO_NOTE, MODE_TO_GIF]),
-    "audio": ("🎵 Аудио", [MODE_TO_VOICE, MODE_EXTRACT_AUDIO]),
-}
-
-# Подписи кнопок режимов в меню
-MODE_BUTTON = {
-    MODE_VIDEO_NOTE:    "⭕ Кружок",
-    MODE_TO_GIF:        "🖼️ GIF",
-    MODE_TO_VOICE:      "🎙️ В голосовое",
-    MODE_EXTRACT_AUDIO: "🎶 Извлечь аудио",
-}
-
-CROP_LABELS = {"top": "сверху", "center": "по центру", "bottom": "снизу"}
-
-# callback_data: навигация и действия
-CB_ROOT, CB_VIDEO, CB_AUDIO, CB_GIF_ALL = "nav:root", "nav:video", "nav:audio", "gif:all"
-# режимы — "set:<command>", области кадра — "crop:<pos>"
+CROP_LABELS = {"top": "сверху", "center": "по центру", "bottom": "снизу",
+               "left": "слева", "right": "справа"}
 
 
-def kb_root() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(CATEGORIES["video"][0], callback_data=CB_VIDEO),
-        InlineKeyboardButton(CATEGORIES["audio"][0], callback_data=CB_AUDIO),
-    ]])
+# --- НИЖНЕЕ МЕНЮ (reply-клавиатуры) ---
+BTN_VIDEO, BTN_AUDIO        = "🎬 Видео", "🎵 Аудио"
+BTN_CIRCLE, BTN_GIF         = "⭕ Кружок", "🖼️ GIF"
+BTN_VOICE, BTN_EXTRACT      = "🎙️ В голосовое", "🎶 Извлечь аудио"
+BTN_TOP, BTN_CENTER, BTN_BOTTOM = "⬆️ Сверху", "⏺️ Центр", "⬇️ Снизу"
+BTN_LEFT, BTN_RIGHT         = "⬅️ Слева", "➡️ Справа"
+BTN_ALL, BTN_BACK           = "✅ Всё", "🔙 Назад"
 
+CROP_BUTTONS = {BTN_TOP: "top", BTN_CENTER: "center", BTN_BOTTOM: "bottom",
+                BTN_LEFT: "left", BTN_RIGHT: "right"}
 
-def kb_category(cat: str) -> InlineKeyboardMarkup:
-    modes = CATEGORIES[cat][1]
-    row = [InlineKeyboardButton(MODE_BUTTON[m], callback_data=f"set:{MODES[m].command}") for m in modes]
-    return InlineKeyboardMarkup([row, [InlineKeyboardButton("⬅️ Назад", callback_data=CB_ROOT)]])
+KB_ROOT  = ReplyKeyboardMarkup([[BTN_VIDEO, BTN_AUDIO]], resize_keyboard=True)
+KB_VIDEO = ReplyKeyboardMarkup([[BTN_CIRCLE, BTN_GIF], [BTN_BACK]], resize_keyboard=True)
+KB_AUDIO = ReplyKeyboardMarkup([[BTN_VOICE, BTN_EXTRACT], [BTN_BACK]], resize_keyboard=True)
+KB_CROP  = ReplyKeyboardMarkup(
+    [[BTN_TOP, BTN_CENTER, BTN_BOTTOM], [BTN_LEFT, BTN_RIGHT], [BTN_BACK]], resize_keyboard=True)
+KB_GIF   = ReplyKeyboardMarkup([[BTN_ALL], [BTN_BACK]], resize_keyboard=True)
 
+NAV_BUTTONS = {BTN_VIDEO, BTN_AUDIO, BTN_CIRCLE, BTN_GIF, BTN_VOICE, BTN_EXTRACT,
+               BTN_TOP, BTN_CENTER, BTN_BOTTOM, BTN_LEFT, BTN_RIGHT, BTN_BACK}
 
-def kb_crop() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬆️ Сверху", callback_data="crop:top"),
-         InlineKeyboardButton("⏺️ Центр",  callback_data="crop:center"),
-         InlineKeyboardButton("⬇️ Снизу",  callback_data="crop:bottom")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data=CB_VIDEO)],
-    ])
-
-
-def kb_gif() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Всё",   callback_data=CB_GIF_ALL),
-        InlineKeyboardButton("⬅️ Назад", callback_data=CB_VIDEO),
-    ]])
-
-
-REPLY_MENU = ReplyKeyboardMarkup([[MENU_BUTTON]], resize_keyboard=True)
+# Куда ведёт «Назад» с каждого уровня
+BACK_TARGET = {"video": "root", "audio": "root", "crop": "video", "gif": "video"}
+LEVEL_KB = {"root": KB_ROOT, "video": KB_VIDEO, "audio": KB_AUDIO, "crop": KB_CROP, "gif": KB_GIF}
 
 
 # --- FFMPEG: ленивый семафор ---
@@ -222,7 +196,7 @@ def ffmpeg_semaphore() -> asyncio.Semaphore:
 # --- УТИЛИТЫ ---
 
 def guess_extension(file_ref, file_type: str) -> str:
-    """Подбирает расширение для скачанного файла (ffmpeg определяет формат по содержимому)."""
+    """Расширение для скачанного файла (ffmpeg определяет формат по содержимому)."""
     if file_type in ("video", "video_note", "animation"):
         return ".mp4"
     if file_type == "voice":
@@ -232,7 +206,7 @@ def guess_extension(file_ref, file_type: str) -> str:
     ext = os.path.splitext(name)[1].lower()
     if file_type == "audio":
         return ext or ".mp3"
-    if ext:                                        # audio_doc / document с именем
+    if ext:
         return ext
     for needle, e in (("wav", ".wav"), ("mp3", ".mp3"), ("mpeg", ".mp3"),
                       ("ogg", ".ogg"), ("video", ".mp4")):
@@ -252,15 +226,15 @@ def pick_file(message):
     """Возвращает (объект файла, тип) или (None, None)."""
     if message.video:      return message.video,      "video"
     if message.video_note: return message.video_note, "video_note"
-    if message.animation:  return message.animation,  "animation"   # GIF приходит как animation
+    if message.animation:  return message.animation,  "animation"
     if message.audio:      return message.audio,      "audio"
     if message.voice:      return message.voice,      "voice"
-    if message.photo:      return message.photo[-1],  "photo"        # фото → как медиа (неподходящий тип)
+    if message.photo:      return message.photo[-1],  "photo"
     if message.document:
         mime = (message.document.mime_type or "").lower()
         ext  = os.path.splitext(message.document.file_name or "")[1].lower()
-        # Многие форматы Telegram шлёт как «документ» с mime application/octet-stream —
-        # тогда ориентируемся на расширение файла.
+        if mime == "image/gif" or ext == ".gif":
+            return message.document, "animation"                      # GIF файлом → как анимация
         if mime.startswith("audio/") or ext in AUDIO_EXTS:
             return message.document, "audio_doc"
         if mime.startswith("video/") or ext in VIDEO_EXTS:
@@ -270,7 +244,6 @@ def pick_file(message):
 
 
 def probe_duration(src: str) -> Optional[float]:
-    """Длительность входного файла в секундах (для расчёта процентов)."""
     try:
         info = ffmpeg.probe(src)
         dur = info.get("format", {}).get("duration")
@@ -280,16 +253,16 @@ def probe_duration(src: str) -> Optional[float]:
 
 
 def has_audio_stream(src: str) -> bool:
-    """True, если в файле есть звуковая дорожка (для аудио-режимов)."""
+    """True, если в файле есть звуковая дорожка."""
     try:
         info = ffmpeg.probe(src)
         return any(s.get("codec_type") == "audio" for s in info.get("streams", []))
     except Exception:
-        return True   # не смогли проверить — не блокируем, пусть решает ffmpeg
+        return True   # не смогли проверить — не блокируем
 
 
 def parse_time(s: str) -> Optional[float]:
-    """'SS' / 'M:SS' / 'MM:SS' / 'H:MM:SS' → секунды (float) или None."""
+    """'SS' / 'M:SS' / 'MM:SS' / 'H:MM:SS' → секунды или None."""
     s = (s or "").strip()
     if not s:
         return None
@@ -307,7 +280,7 @@ def parse_time(s: str) -> Optional[float]:
 
 
 def parse_interval(text: str):
-    """'0:05-0:25' / '5-25' / '0:05 0:25' → (start, end) в секундах или None."""
+    """'0:05-0:25' / '5-25' / '0:05 0:25' → (start, end) или None."""
     t = (text or "").strip().replace("–", "-").replace("—", "-")
     parts = [p for p in re.split(r"\s*-\s*|\s+", t) if p]
     if len(parts) != 2:
@@ -319,7 +292,6 @@ def parse_interval(text: str):
 
 
 def read_progress_ratio(path: str, total: float) -> Optional[float]:
-    """Читает progress-файл ffmpeg и возвращает долю выполнения (0.0–0.999) или None."""
     if not total or total <= 0:
         return None
     try:
@@ -350,12 +322,11 @@ def format_eta(seconds: float) -> str:
 
 async def progress_loop(status_msg, base: str, path: str, total: float,
                         stop: asyncio.Event, start: float):
-    """Периодически обновляет статусное сообщение прогрессом и ETA, пока stop не выставлен."""
     last_text = None
     while not stop.is_set():
         try:
             await asyncio.wait_for(stop.wait(), timeout=PROGRESS_INTERVAL)
-            break                                   # stop выставлен — выходим
+            break
         except asyncio.TimeoutError:
             pass
         ratio = read_progress_ratio(path, total)
@@ -363,7 +334,7 @@ async def progress_loop(status_msg, base: str, path: str, total: float,
             continue
         pct = max(0, min(99, int(ratio * 100)))
         line = f"{base}…\n{progress_bar(pct)} {pct}%"
-        if ratio > 0.03:                            # ETA — только когда есть осмысленный сигнал
+        if ratio > 0.03:
             elapsed = time.monotonic() - start
             line += f" · осталось {format_eta(elapsed * (1 - ratio) / ratio)}"
         if line != last_text:
@@ -371,89 +342,99 @@ async def progress_loop(status_msg, base: str, path: str, total: float,
             try:
                 await status_msg.edit_text(line)
             except Exception:
-                pass                                 # "not modified", флуд-лимит и т.п. — игнорируем
+                pass
 
 
 # --- FFMPEG: построение конвертаций ---
 
-# Вертикальное смещение кропа для кружка (x всегда по центру).
-CROP_Y = {"top": "0", "center": "(in_h-out_h)/2", "bottom": "in_h-out_h"}
+# Квадратный кроп min(iw,ih); x — по горизонтали, y — по вертикали.
+CROP_POS = {
+    "top":    ("(iw-min(iw,ih))/2", "0"),
+    "center": ("(iw-min(iw,ih))/2", "(ih-min(iw,ih))/2"),
+    "bottom": ("(iw-min(iw,ih))/2", "ih-min(iw,ih)"),
+    "left":   ("0",                 "(ih-min(iw,ih))/2"),
+    "right":  ("iw-min(iw,ih)",     "(ih-min(iw,ih))/2"),
+}
 
 
 def build_video_note(src: str, dst: str, crop: str = "center"):
-    probe = ffmpeg.probe(src)
-    streams = probe.get("streams", [])
-    video = next((s for s in streams if s.get("codec_type") == "video"), None)
-    has_audio = any(s.get("codec_type") == "audio" for s in streams)
-    if not video:
-        raise ValueError("Видеопоток не найден.")
-
-    side = min(int(video.get("width", VIDEO_NOTE_SIZE)), int(video.get("height", VIDEO_NOTE_SIZE)))
-    y = CROP_Y.get(crop, CROP_Y["center"])
+    has_audio = has_audio_stream(src)
+    x, y = CROP_POS.get(crop, CROP_POS["center"])
     inp = ffmpeg.input(src, t=LIMIT_VIDEO_NOTE)
     v = (inp["v:0"]
-         .filter("crop", side, side, "(in_w-out_w)/2", y)        # квадрат с выбранной областью
+         .filter("crop", "min(iw,ih)", "min(iw,ih)", x, y)          # квадрат с выбранной областью
          .filter("scale", VIDEO_NOTE_SIZE, VIDEO_NOTE_SIZE, flags="lanczos"))
-
-    params = {
+    common = {
         "vcodec": "libx264",
-        "pix_fmt": "yuv420p",          # совместимость со всеми плеерами
-        "crf": 23,                     # качество по CRF (меньше — лучше) вместо фиксированного битрейта
+        "pix_fmt": "yuv420p",          # 8-бит → совместимость + устойчивость к 10-бит/HDR
+        "crf": 23,                     # качество по CRF (меньше — лучше)
         "preset": "veryfast",
-        "movflags": "+faststart",      # moov-атом в начало → быстрый старт воспроизведения
+        "r": VIDEO_NOTE_FPS,           # фикс. fps → легче и стабильнее
+        "movflags": "+faststart",
         "format": "mp4",
+        "map_metadata": -1,            # выкидываем метаданные (в т.ч. Dolby Vision)
     }
     if has_audio:
         return ffmpeg.output(v, inp["a:0"], dst, acodec="aac",
-                             **{"b:a": "128k"}, **params)
-    return ffmpeg.output(v, dst, an=None, **params)
+                             **{"b:a": "128k"}, **common)
+    return ffmpeg.output(v, dst, an=None, **common)
 
 
 def build_to_voice(src: str, dst: str):
-    return ffmpeg.output(
-        ffmpeg.input(src, t=LIMIT_AUDIO),
-        dst,
-        vn=None,
-        acodec="libopus",
-        format="ogg",
-        map_metadata=-1,
-    )
+    inp = ffmpeg.input(src, t=LIMIT_AUDIO)
+    return ffmpeg.output(inp["a:0"], dst, acodec="libopus", format="ogg", map_metadata=-1)
 
 
 def build_extract_audio(src: str, dst: str):
-    return ffmpeg.output(
-        ffmpeg.input(src, t=LIMIT_AUDIO),
-        dst,
-        vn=None,
-        acodec="libmp3lame",
-        format="mp3",
-        **{"b:a": "192k"},
-    )
+    inp = ffmpeg.input(src, t=LIMIT_AUDIO)
+    return ffmpeg.output(inp["a:0"], dst, acodec="libmp3lame", format="mp3",
+                         map_metadata=-1, **{"b:a": "192k"})
 
 
 def build_to_gif(src: str, dst: str, palette: str, start: float = 0.0, duration: float = LIMIT_GIF):
     scale_w = "if(gte(iw,ih),320,-2)"
     scale_h = "if(gte(iw,ih),-2,320)"
-    base = (
-        ffmpeg.input(src, ss=start, t=duration)        # вырезаем выбранный отрезок
-        .filter("fps", fps=15)
-        .filter("scale", scale_w, scale_h)
-    )
-    p1 = base.filter("palettegen").output(palette, f="image2").overwrite_output()
+    base = (ffmpeg.input(src, ss=start, t=duration)
+            .filter("fps", fps=15)
+            .filter("scale", scale_w, scale_h))
+    p1 = base.filter("palettegen").output(palette, format="image2")
     used = ffmpeg.filter([base, ffmpeg.input(palette)], "paletteuse")
     p2 = ffmpeg.output(used, dst, format="gif", an=None, loop=0)
     return p1, p2
 
 
+async def run_ffmpeg(spec, prog: Optional[str] = None, timeout: int = CONVERSION_TIMEOUT):
+    """Запуск ffmpeg как асинхронного процесса с таймаутом и принудительным завершением."""
+    if prog:
+        spec = spec.global_args("-progress", prog, "-nostats")
+    args = ffmpeg.compile(spec, overwrite_output=True)
+    proc = await asyncio.create_subprocess_exec(
+        *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        raise
+    if proc.returncode:
+        raise ffmpeg.Error("ffmpeg", b"", stderr or b"")
+    return stderr
+
+
 # --- ОТПРАВКА РЕЗУЛЬТАТА ---
+
+def _reply_params(msg_id):
+    return ReplyParameters(message_id=msg_id, allow_sending_without_reply=True)
+
 
 async def send_result(bot, chat_id, mode, path, ext, reply_to):
     kwargs = {
-        "reply_to_message_id": reply_to,
-        "allow_sending_without_reply": True,           # если исходное сообщение удалили — всё равно отправим
-        "read_timeout": 120,
-        "write_timeout": 120,
-        "connect_timeout": 180,
+        "reply_parameters": _reply_params(reply_to),
+        "read_timeout": 120, "write_timeout": 120, "connect_timeout": 180,
     }
     with open(path, "rb") as fh:
         media = InputFile(fh, filename=f"result{ext}")
@@ -467,40 +448,41 @@ async def send_result(bot, chat_id, mode, path, ext, reply_to):
             await bot.send_animation(chat_id, animation=media, **kwargs)
 
 
+async def _safe_edit(msg, text):
+    try:
+        await msg.edit_text(text)
+    except Exception:
+        pass
+
+
 # --- КОНВЕРТАЦИЯ ---
 
 async def run_conversion(context, chat_id, reply_to, file_ref, file_type, mode,
                          status=None, crop="center", gif_start=0.0, gif_duration=None):
     cfg = MODES[mode]
     gif_duration = gif_duration or float(cfg.limit)
-    work_dir = tempfile.mkdtemp(prefix="tgconv_")          # уникальная папка → безопасно при параллельных задачах
+    work_dir = tempfile.mkdtemp(prefix="tgconv_")
     src      = os.path.join(work_dir, f"in{guess_extension(file_ref, file_type)}")
     dst      = os.path.join(work_dir, f"out{cfg.output_ext}")
     palette  = os.path.join(work_dir, "palette.png")
     prog     = os.path.join(work_dir, "progress.txt")
 
-    # status может быть уже создан (плашка «в очереди») — тогда переиспользуем его.
     if status is None:
-        status = await context.bot.send_message(chat_id, f"{cfg.status}…")
+        status = await context.bot.send_message(
+            chat_id, f"{cfg.status}…", reply_parameters=_reply_params(reply_to))
     else:
-        try:
-            await status.edit_text(f"{cfg.status}…")
-        except Exception:
-            pass
+        await _safe_edit(status, f"{cfg.status}…")
+
     try:
         tg_file = await file_ref.get_file()
         await tg_file.download_to_drive(
-            src, read_timeout=180, write_timeout=180, connect_timeout=180
-        )
+            src, read_timeout=180, write_timeout=180, connect_timeout=180)
 
-        # Если режим даёт аудио, а звуковой дорожки нет — понятное сообщение вместо ошибки формата.
         if mode in AUDIO_OUTPUT_MODES and not has_audio_stream(src):
             await status.edit_text("❌ В этом файле нет звука — обрабатывать нечего.")
             return
 
         real = probe_duration(src)
-
-        # Сколько секунд реально обрабатываем — для процентов.
         if mode == MODE_TO_GIF:
             if real and gif_start >= real:
                 await status.edit_text("❌ Указанное время за пределами длины видео.")
@@ -509,49 +491,46 @@ async def run_conversion(context, chat_id, reply_to, file_ref, file_type, mode,
         else:
             total = min(real, cfg.limit) if real else float(cfg.limit)
 
-        open(prog, "w").close()                            # progress-файл должен существовать
-
-        def process():
-            g = ("-progress", prog, "-nostats")
-            if mode == MODE_VIDEO_NOTE:
-                build_video_note(src, dst, crop).global_args(*g).run(overwrite_output=True, quiet=True)
-            elif mode == MODE_TO_VOICE:
-                build_to_voice(src, dst).global_args(*g).run(overwrite_output=True, quiet=True)
-            elif mode == MODE_EXTRACT_AUDIO:
-                build_extract_audio(src, dst).global_args(*g).run(overwrite_output=True, quiet=True)
-            else:
-                p1, p2 = build_to_gif(src, dst, palette, gif_start, gif_duration)
-                p1.run(quiet=True)                         # палитра считается быстро, без прогресса
-                p2.global_args(*g).run(overwrite_output=True, quiet=True)
+        open(prog, "w").close()
 
         async with ffmpeg_semaphore():
             stop = asyncio.Event()
-            start = time.monotonic()                       # отсчёт для ETA — с момента старта ffmpeg
+            start = time.monotonic()
             updater = asyncio.create_task(progress_loop(status, cfg.status, prog, total, stop, start))
             try:
-                await asyncio.to_thread(process)
+                if mode == MODE_VIDEO_NOTE:
+                    await run_ffmpeg(build_video_note(src, dst, crop), prog)
+                elif mode == MODE_TO_VOICE:
+                    await run_ffmpeg(build_to_voice(src, dst), prog)
+                elif mode == MODE_EXTRACT_AUDIO:
+                    await run_ffmpeg(build_extract_audio(src, dst), prog)
+                else:
+                    p1, p2 = build_to_gif(src, dst, palette, gif_start, gif_duration)
+                    await run_ffmpeg(p1)              # палитра — быстро, без прогресса
+                    await run_ffmpeg(p2, prog)
             finally:
                 stop.set()
                 await updater
 
         await send_result(context.bot, chat_id, mode, dst, cfg.output_ext, reply_to)
-
         try:
             await status.delete()
         except Exception:
             pass
 
+    except asyncio.TimeoutError:
+        await _safe_edit(status, "❌ Обработка заняла слишком долго и была остановлена. Попробуйте файл покороче.")
     except BadRequest as e:
         text = "❌ Файл слишком большой." if "too big" in str(e).lower() else f"❌ Ошибка отправки: {e}"
-        await status.edit_text(text)
+        await _safe_edit(status, text)
     except ffmpeg.Error as e:
-        logger.error("ffmpeg error: %s", (e.stderr or b"").decode(errors="ignore"))
-        await status.edit_text("❌ Ошибка обработки файла. Проверьте формат.")
+        logger.error("ffmpeg error: %s", (e.stderr or b"").decode(errors="ignore")[-800:])
+        await _safe_edit(status, "❌ Ошибка обработки файла. Проверьте формат.")
     except Exception as e:
         logger.error("Conversion error: %s", e, exc_info=True)
-        await status.edit_text("❌ Произошла ошибка.")
+        await _safe_edit(status, "❌ Произошла ошибка.")
     finally:
-        shutil.rmtree(work_dir, ignore_errors=True)        # одна уборка вместо удаления каждого файла
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 async def process_now(context, chat_id, reply_to, file_ref, file_type, mode,
@@ -564,14 +543,15 @@ async def process_now(context, chat_id, reply_to, file_ref, file_type, mode,
 
     status = None
     if lock.locked():
-        status = await context.bot.send_message(chat_id, "🕓 В очереди…")
+        status = await context.bot.send_message(
+            chat_id, "🕓 В очереди…", reply_parameters=_reply_params(reply_to))
 
     async with lock:
         await run_conversion(context, chat_id, reply_to, file_ref, file_type, mode,
                              status=status, crop=crop, gif_start=gif_start, gif_duration=gif_duration)
 
 
-# --- ХЭНДЛЕРЫ ---
+# --- МЕНЮ И ВСПОМОГАТЕЛЬНОЕ ---
 
 GROUP_REPLY_NOTE = (
     "\n\n📎 В группе пришлите файл ответом (reply) на это сообщение бота — "
@@ -580,14 +560,12 @@ GROUP_REPLY_NOTE = (
 
 
 def with_group_note(text: str, chat) -> str:
-    """В группе добавляет примечание: файл нужно слать ответом на сообщение бота."""
     if chat.type in ("group", "supergroup"):
         return text + GROUP_REPLY_NOTE
     return text
 
 
 def set_mode(context, mode: int, crop: Optional[str] = None) -> None:
-    """Устанавливает режим, сбрасывает ожидание отрезка GIF, при необходимости — область кадра."""
     context.user_data[STATE_KEY] = mode
     context.user_data[PENDING_KEY] = None
     if crop:
@@ -603,146 +581,184 @@ def confirm_text(mode: int, crop: Optional[str] = None) -> str:
     return f"{head}\n{cfg.prompt}"
 
 
-async def send_root_menu(message) -> None:
-    await message.reply_text("Что делаем?", reply_markup=kb_root())
-
-
 async def prompt_send_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Реакция на текст/стикер: просим файл (если режим выбран) или показываем меню."""
     if context.user_data.get(STATE_KEY) is not None:
         await update.message.reply_text("📎 Отправьте медиафайл — текст и стикеры я не конвертирую.")
     else:
-        await update.message.reply_text("⚠️ Сначала выберите режим:")
-        await send_root_menu(update.message)
+        context.user_data[MENU_KEY] = "root"
+        await update.message.reply_text("⚠️ Сначала выберите режим в меню ниже.", reply_markup=KB_ROOT)
 
+
+# --- ХЭНДЛЕРЫ ---
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data[MENU_KEY] = "root"
     await update.message.reply_text(
         "👋 Привет! Я делаю кружки и голосовые, извлекаю аудио и собираю GIF.\n"
-        "Нажмите «☰ Меню» внизу или выберите ниже.",
-        reply_markup=REPLY_MENU,
+        "Выберите, что нужно, в меню ниже.",
+        reply_markup=KB_ROOT,
     )
-    await send_root_menu(update.message)
 
 
 def make_mode_command(mode: int):
-    """Команды (/videonote и т.д.) — быстрый доступ к режиму в обход меню."""
+    """Команды (/videonote и т.д.) — быстрый доступ к режиму."""
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        set_mode(context, mode)
         chat = update.effective_chat
         if mode == MODE_VIDEO_NOTE:
             crop = context.user_data.get(CROP_KEY, "center")
-            await update.message.reply_text(with_group_note(confirm_text(mode, crop), chat))
+            set_mode(context, mode, crop=crop)
+            context.user_data[MENU_KEY] = "crop"
+            await update.message.reply_text(with_group_note(confirm_text(mode, crop), chat), reply_markup=KB_CROP)
         elif mode == MODE_TO_GIF:
-            await update.message.reply_text(with_group_note(confirm_text(mode), chat), reply_markup=kb_gif())
+            set_mode(context, mode)
+            context.user_data[MENU_KEY] = "gif"
+            await update.message.reply_text(with_group_note(confirm_text(mode), chat), reply_markup=KB_GIF)
         else:
-            await update.message.reply_text(with_group_note(confirm_text(mode), chat))
+            set_mode(context, mode)
+            context.user_data[MENU_KEY] = "audio"
+            await update.message.reply_text(with_group_note(confirm_text(mode), chat), reply_markup=KB_AUDIO)
     return handler
 
 
-async def gif_all(query, context) -> None:
-    """Кнопка «Всё»: делает GIF из первых 30 секунд присланного видео."""
+async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """Навигация по нижнему меню и выбор режима."""
+    ud = context.user_data
+    ud[PENDING_KEY] = None                                   # любая навигация отменяет ожидание отрезка
+    chat = update.effective_chat
+
+    if text == BTN_VIDEO:
+        ud[MENU_KEY] = "video"
+        await update.message.reply_text("🎬 Видео:", reply_markup=KB_VIDEO)
+    elif text == BTN_AUDIO:
+        ud[MENU_KEY] = "audio"
+        await update.message.reply_text("🎵 Аудио:", reply_markup=KB_AUDIO)
+    elif text == BTN_CIRCLE:
+        ud[MENU_KEY] = "crop"
+        await update.message.reply_text("⭕ Кружок — какую часть кадра брать?", reply_markup=KB_CROP)
+    elif text in CROP_BUTTONS:
+        crop = CROP_BUTTONS[text]
+        set_mode(context, MODE_VIDEO_NOTE, crop=crop)
+        ud[MENU_KEY] = "crop"
+        await update.message.reply_text(with_group_note(confirm_text(MODE_VIDEO_NOTE, crop), chat), reply_markup=KB_CROP)
+    elif text == BTN_GIF:
+        set_mode(context, MODE_TO_GIF)
+        ud[MENU_KEY] = "gif"
+        await update.message.reply_text(with_group_note(confirm_text(MODE_TO_GIF), chat), reply_markup=KB_GIF)
+    elif text == BTN_VOICE:
+        set_mode(context, MODE_TO_VOICE)
+        ud[MENU_KEY] = "audio"
+        await update.message.reply_text(with_group_note(confirm_text(MODE_TO_VOICE), chat), reply_markup=KB_AUDIO)
+    elif text == BTN_EXTRACT:
+        set_mode(context, MODE_EXTRACT_AUDIO)
+        ud[MENU_KEY] = "audio"
+        await update.message.reply_text(with_group_note(confirm_text(MODE_EXTRACT_AUDIO), chat), reply_markup=KB_AUDIO)
+    elif text == BTN_BACK:
+        target = BACK_TARGET.get(ud.get(MENU_KEY), "root")
+        ud[MENU_KEY] = target
+        titles = {"root": "Что делаем?", "video": "🎬 Видео:", "audio": "🎵 Аудио:"}
+        await update.message.reply_text(titles.get(target, "Что делаем?"), reply_markup=LEVEL_KB[target])
+
+
+async def gif_from_pending(context, update, start, duration):
+    """Запускает GIF из отложенного файла на заданном отрезке."""
     pending = context.user_data.get(PENDING_KEY)
     if not pending:
-        await query.answer("Сначала пришлите видео для GIF.", show_alert=True)
         return
-    await query.answer()
     context.user_data[PENDING_KEY] = None
-    await process_now(context, query.message.chat_id, pending["reply_to"],
+    await process_now(context, update.message.chat_id, pending["reply_to"],
                       pending["file_ref"], pending["file_type"], MODE_TO_GIF,
-                      gif_start=0.0, gif_duration=float(LIMIT_GIF))
-
-
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    data = query.data or ""
-    chat = query.message.chat
-    try:
-        if data == CB_ROOT:
-            await query.edit_message_text("Что делаем?", reply_markup=kb_root())
-        elif data == CB_VIDEO:
-            await query.edit_message_text(CATEGORIES["video"][0], reply_markup=kb_category("video"))
-        elif data == CB_AUDIO:
-            await query.edit_message_text(CATEGORIES["audio"][0], reply_markup=kb_category("audio"))
-        elif data == "set:videonote":
-            await query.edit_message_text("⭕ Кружок — какую часть кадра брать?", reply_markup=kb_crop())
-        elif data.startswith("crop:"):
-            crop = data.split(":", 1)[1]
-            set_mode(context, MODE_VIDEO_NOTE, crop=crop)
-            await query.edit_message_text(with_group_note(confirm_text(MODE_VIDEO_NOTE, crop), chat))
-        elif data == "set:togif":
-            set_mode(context, MODE_TO_GIF)
-            await query.edit_message_text(with_group_note(confirm_text(MODE_TO_GIF), chat), reply_markup=kb_gif())
-        elif data.startswith("set:"):
-            mode = COMMAND_TO_MODE.get(data.split(":", 1)[1])
-            if mode is not None:
-                set_mode(context, mode)
-                await query.edit_message_text(with_group_note(confirm_text(mode), chat))
-        elif data == CB_GIF_ALL:
-            await gif_all(query, context)
-            return                                       # gif_all сам отвечает на query
-        await query.answer()
-    except BadRequest:
-        # "message is not modified" и подобное — не страшно
-        try:
-            await query.answer()
-        except Exception:
-            pass
-    except Exception as e:
-        logger.error("Callback error: %s", e, exc_info=True)
-        try:
-            await query.answer()
-        except Exception:
-            pass
-
-
-async def _start_gif(message, context, file_ref, file_type, seg) -> None:
-    """Запускает GIF по готовому отрезку seg=(start,end) с проверкой лимита длины."""
-    start, end = seg
-    if end - start > LIMIT_GIF:
-        await message.reply_text(f"❌ Максимум {LIMIT_GIF} секунд для GIF. Укажите отрезок покороче.")
-        return
-    await process_now(context, message.chat_id, message.message_id, file_ref, file_type,
-                      MODE_TO_GIF, gif_start=start, gif_duration=end - start)
+                      gif_start=start, gif_duration=duration)
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
+    ud = context.user_data
 
-    if text == MENU_BUTTON:
-        await send_root_menu(update.message)
+    # Кнопка «Всё» — отдельно (использует отложенный файл)
+    if text == BTN_ALL:
+        if ud.get(PENDING_KEY):
+            await gif_from_pending(context, update, 0.0, float(LIMIT_GIF))
+        else:
+            await update.message.reply_text("Сначала пришлите видео или кружок для GIF.")
         return
 
-    # Ждём ввод отрезка для GIF?
-    pending = context.user_data.get(PENDING_KEY)
-    if pending:
+    # Навигация по меню
+    if text in NAV_BUTTONS:
+        await handle_menu_button(update, context, text)
+        return
+
+    # Ждём отрезок для GIF?
+    if ud.get(PENDING_KEY):
         if text.lower() in ("всё", "все", "all"):
-            context.user_data[PENDING_KEY] = None
-            await process_now(context, update.message.chat_id, pending["reply_to"],
-                              pending["file_ref"], pending["file_type"], MODE_TO_GIF,
-                              gif_start=0.0, gif_duration=float(LIMIT_GIF))
+            await gif_from_pending(context, update, 0.0, float(LIMIT_GIF))
             return
         seg = parse_interval(text)
-        if seg:
-            context.user_data[PENDING_KEY] = None
-            await _start_gif(update.message, context, pending["file_ref"], pending["file_type"], seg)
+        if seg is None:
+            await update.message.reply_text(
+                f"Не понял время. Формат 0:05-0:25 (максимум {LIMIT_GIF} секунд) или нажмите «✅ Всё».")
             return
-        await update.message.reply_text(
-            f"Не понял время. Формат 0:05-0:25 (максимум {LIMIT_GIF} секунд) или нажмите «Всё»."
-        )
+        start, end = seg
+        if end - start > LIMIT_GIF:
+            await update.message.reply_text(
+                f"❌ Максимум {LIMIT_GIF} секунд для GIF. Укажите отрезок покороче.")
+            return
+        await gif_from_pending(context, update, start, end - start)
         return
 
-    # Обычный текст — подсказка.
+    # Прочий текст
     await prompt_send_file(update, context)
 
 
 async def on_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if context.user_data.get(PENDING_KEY):
         await update.message.reply_text(
-            f"✂️ Жду время для GIF: формат 0:05-0:25 (максимум {LIMIT_GIF} секунд) или нажмите «Всё»."
-        )
+            f"✂️ Жду время для GIF (0:05-0:25, максимум {LIMIT_GIF} секунд) или нажмите «✅ Всё».")
         return
     await prompt_send_file(update, context)
+
+
+async def handle_gif_media(update: Update, context: ContextTypes.DEFAULT_TYPE, file_ref, file_type) -> None:
+    """GIF: по одному файлу за раз; альбом → первый файл в работу, на остальные одно предупреждение."""
+    message = update.message
+    ud = context.user_data
+    mg = message.media_group_id
+
+    # Уже есть отложенный файл → за раз только один
+    if ud.get(PENDING_KEY):
+        if mg is not None and ud.get(GROUP_KEY) == mg:
+            return                                           # про этот альбом уже сказали
+        ud[GROUP_KEY] = mg
+        await message.reply_text(
+            "🖼️ За раз обрабатываю один файл. Сначала закончите с текущим — "
+            "пришлите отрезок или нажмите «✅ Всё».", do_quote=True)
+        return
+
+    # Отрезок в подписи?
+    seg = parse_interval(message.caption or "")
+    if seg:
+        start, end = seg
+        if end - start > LIMIT_GIF:
+            await message.reply_text(
+                f"❌ Максимум {LIMIT_GIF} секунд для GIF. Укажите отрезок покороче.", do_quote=True)
+            return
+        await process_now(context, message.chat_id, message.message_id, file_ref, file_type,
+                          MODE_TO_GIF, gif_start=start, gif_duration=end - start)
+        return
+
+    if message.chat.type != "private":
+        # в группе пошаговый диалог не работает — берём первые 30 секунд
+        await process_now(context, message.chat_id, message.message_id, file_ref, file_type,
+                          MODE_TO_GIF, gif_start=0.0, gif_duration=float(LIMIT_GIF))
+        return
+
+    # Личка: запоминаем файл (синхронно, до await) и спрашиваем отрезок
+    ud[PENDING_KEY] = {"file_ref": file_ref, "file_type": file_type, "reply_to": message.message_id}
+    ud[GROUP_KEY] = None
+    await message.reply_text(
+        "✂️ На какой отрезок делать GIF?\n"
+        f"Пришлите время в формате 0:05-0:25 (максимум {LIMIT_GIF} секунд) "
+        "или нажмите «✅ Всё» — возьму первые 30 секунд.", do_quote=True)
 
 
 async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -755,50 +771,34 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     mode = context.user_data.get(STATE_KEY)
     if mode is None:
         if chat.type == "private":
-            await message.reply_text("⚠️ Сначала выберите режим:")
-            await send_root_menu(message)
+            context.user_data[MENU_KEY] = "root"
+            await message.reply_text("⚠️ Сначала выберите режим в меню ниже.",
+                                     reply_markup=KB_ROOT, do_quote=True)
         return
 
-    if file_type == MODES[mode].same_type:
-        await message.reply_text(MODES[mode].same_type_error)
+    cfg = MODES[mode]
+    if file_type in cfg.same_types:
+        await message.reply_text(cfg.same_type_error, do_quote=True)
         return
-
-    if file_type not in MODES[mode].valid_types:
-        await message.reply_text(MODES[mode].error)
+    if file_type not in cfg.valid_types:
+        await message.reply_text(cfg.error, do_quote=True)
         return
 
     size = getattr(file_ref, "file_size", None) or 0
     if size > MAX_DOWNLOAD_SIZE:
-        await message.reply_text("❌ Файл слишком большой — Telegram позволяет боту скачивать до 20 МБ.")
+        await message.reply_text("❌ Файл слишком большой — бот может скачивать файлы до 20 МБ.", do_quote=True)
         return
 
-    # GIF: нужен отрезок. Если он задан в подписи — конвертируем сразу;
-    # в личке без подписи — спрашиваем; в группе диалог не работает, берём первые 30 сек.
     if mode == MODE_TO_GIF:
-        seg = parse_interval(message.caption or "")
-        if seg:
-            await _start_gif(message, context, file_ref, file_type, seg)
-        elif chat.type != "private":
-            await process_now(context, chat.id, message.message_id, file_ref, file_type,
-                              MODE_TO_GIF, gif_start=0.0, gif_duration=float(LIMIT_GIF))
-        else:
-            context.user_data[PENDING_KEY] = {
-                "file_ref": file_ref, "file_type": file_type, "reply_to": message.message_id,
-            }
-            await message.reply_text(
-                "✂️ На какой отрезок делать GIF?\n"
-                f"Пришлите время в формате 0:05-0:25 (максимум {LIMIT_GIF} секунд) "
-                "или нажмите «Всё» в меню — возьму первые 30 секунд."
-            )
+        await handle_gif_media(update, context, file_ref, file_type)
         return
 
-    # Остальные режимы — конвертируем сразу (липкий режим: можно слать подряд).
     crop = context.user_data.get(CROP_KEY, "center")
     await process_now(context, chat.id, message.message_id, file_ref, file_type, mode, crop=crop)
 
 
 async def on_unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Неизвестная команда. Откройте «☰ Меню».")
+    await update.message.reply_text("Неизвестная команда. Откройте меню кнопками ниже или /start.")
 
 
 # --- ЗАПУСК ---
@@ -813,18 +813,11 @@ def main() -> None:
     for mode_id, cfg in MODES.items():
         app.add_handler(CommandHandler(cfg.command, make_mode_command(mode_id)))
 
-    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_text))
 
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
-        on_text,
-    ))
-
-    # Стикеры (как и текст) — не файлы: просим прислать файл / выбрать режим.
-    app.add_handler(MessageHandler(
-        filters.Sticker.ALL & filters.ChatType.PRIVATE,
-        on_sticker,
-    ))
+        filters.Sticker.ALL & filters.ChatType.PRIVATE, on_sticker))
 
     media_filter = (
         filters.VIDEO | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE |
@@ -832,11 +825,8 @@ def main() -> None:
     )
     app.add_handler(MessageHandler(media_filter, on_media))
 
-    # Неизвестные команды — регистрируем после всех конкретных, только в личке.
     app.add_handler(MessageHandler(
-        filters.COMMAND & filters.ChatType.PRIVATE,
-        on_unknown_command,
-    ))
+        filters.COMMAND & filters.ChatType.PRIVATE, on_unknown_command))
 
     logger.info("Бот запущен.")
     app.run_polling()
