@@ -5,8 +5,9 @@ Telegram-бот для конвертации медиа:
   • видео/кружок → извлечение аудио (mp3)
   • видео/кружок → GIF (с выбором временного отрезка, по одному файлу за раз)
 
-Версия 2.1.0 — нижнее меню по категориям с навигацией, области кадра слева/справа,
-GIF по одному файлу, устойчивость к «тяжёлым» файлам (айфон HEVC/HDR), таймаут конвертации.
+Версия 2.2.0 — кнопка «Отмена» в каждом меню (убивает текущую конвертацию), обязательный
+выбор части кадра для кружка, остановка всей работы при блокировке бота пользователем,
+повышенная устойчивость к «битым»/необычным потокам и понятное логирование ошибок ffmpeg.
 """
 
 import asyncio
@@ -34,7 +35,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden
 
 try:
     from dotenv import load_dotenv          # опционально: загрузка токена из .env
@@ -48,7 +49,7 @@ if load_dotenv is not None:
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 MAX_DOWNLOAD_SIZE     = 20 * 1024 * 1024     # лимит Telegram на скачивание ботом (~20 МБ)
-MAX_CONCURRENT_FFMPEG = 3                    # сколько ffmpeg-задач одновременно (на всех)
+MAX_CONCURRENT_FFMPEG = 2                    # сколько ffmpeg-задач одновременно (на всех); запас по памяти на 1 ГБ
 PROGRESS_INTERVAL     = 2.0                  # как часто обновлять прогресс (сек)
 CONVERSION_TIMEOUT    = 240                  # потолок на одну операцию ffmpeg (сек) — защита от зависаний
 
@@ -62,11 +63,13 @@ VIDEO_NOTE_FPS   = 30                        # фикс. частота кадр
 
 # Ключи в user_data
 STATE_KEY   = "mode"                         # текущий режим
-CROP_KEY    = "crop"                         # область кадра кружка
+CROP_KEY    = "crop"                         # область кадра кружка (None — ещё не выбрана)
 PENDING_KEY = "pending_gif"                  # видео, ожидающее ввода отрезка для GIF
 GROUP_KEY   = "gif_group"                    # media_group_id, про который уже сказали «один за раз»
 MENU_KEY    = "menu"                         # текущий уровень меню (для кнопки «Назад»)
 LOCK_KEY    = "lock"                         # пер-юзер очередь обработки
+BLOCKED_KEY = "blocked"                      # пользователь заблокировал бота → не тратим ресурсы
+TASKS_KEY   = "tasks"                        # набор активных задач конвертации (для отмены)
 
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(
@@ -137,8 +140,8 @@ MODES: "dict[int, Mode]" = {
     MODE_TO_GIF: Mode(
         command="togif",
         title="GIF",
-        prompt="🖼️ Пришлите видео или кружок (за раз — один файл), "
-               "затем укажете отрезок или нажмёте «Всё».",
+        prompt="🖼️ Пришлите видео или кружок (за раз — один файл). Потом укажете отрезок — "
+               "например 0:05-0:25 или 5-25 (в секундах) — либо нажмёте «Всё».",
         status="🖼️ Создаю GIF",
         output_ext=".gif",
         limit=LIMIT_GIF,
@@ -163,16 +166,17 @@ BTN_VOICE, BTN_EXTRACT      = "🎙️ В голосовое", "🎶 Извле�
 BTN_TOP, BTN_CENTER, BTN_BOTTOM = "⬆️ Сверху", "⏺️ Центр", "⬇️ Снизу"
 BTN_LEFT, BTN_RIGHT         = "⬅️ Слева", "➡️ Справа"
 BTN_ALL, BTN_BACK           = "✅ Всё", "🔙 Назад"
+BTN_CANCEL                  = "❌ Отмена"
 
 CROP_BUTTONS = {BTN_TOP: "top", BTN_CENTER: "center", BTN_BOTTOM: "bottom",
                 BTN_LEFT: "left", BTN_RIGHT: "right"}
 
-KB_ROOT  = ReplyKeyboardMarkup([[BTN_VIDEO, BTN_AUDIO]], resize_keyboard=True)
-KB_VIDEO = ReplyKeyboardMarkup([[BTN_CIRCLE, BTN_GIF], [BTN_BACK]], resize_keyboard=True)
-KB_AUDIO = ReplyKeyboardMarkup([[BTN_VOICE, BTN_EXTRACT], [BTN_BACK]], resize_keyboard=True)
+KB_ROOT  = ReplyKeyboardMarkup([[BTN_VIDEO, BTN_AUDIO], [BTN_CANCEL]], resize_keyboard=True)
+KB_VIDEO = ReplyKeyboardMarkup([[BTN_CIRCLE, BTN_GIF], [BTN_BACK, BTN_CANCEL]], resize_keyboard=True)
+KB_AUDIO = ReplyKeyboardMarkup([[BTN_VOICE, BTN_EXTRACT], [BTN_BACK, BTN_CANCEL]], resize_keyboard=True)
 KB_CROP  = ReplyKeyboardMarkup(
-    [[BTN_TOP, BTN_CENTER, BTN_BOTTOM], [BTN_LEFT, BTN_RIGHT], [BTN_BACK]], resize_keyboard=True)
-KB_GIF   = ReplyKeyboardMarkup([[BTN_ALL], [BTN_BACK]], resize_keyboard=True)
+    [[BTN_TOP, BTN_CENTER, BTN_BOTTOM], [BTN_LEFT, BTN_RIGHT], [BTN_BACK, BTN_CANCEL]], resize_keyboard=True)
+KB_GIF   = ReplyKeyboardMarkup([[BTN_ALL], [BTN_BACK, BTN_CANCEL]], resize_keyboard=True)
 
 NAV_BUTTONS = {BTN_VIDEO, BTN_AUDIO, BTN_CIRCLE, BTN_GIF, BTN_VOICE, BTN_EXTRACT,
                BTN_TOP, BTN_CENTER, BTN_BOTTOM, BTN_LEFT, BTN_RIGHT, BTN_BACK}
@@ -345,7 +349,20 @@ async def progress_loop(status_msg, base: str, path: str, total: float,
                 pass
 
 
+def _tail(stderr_bytes, n: int = 6) -> str:
+    """Последние значимые строки stderr ffmpeg — там настоящая причина ошибки."""
+    text = (stderr_bytes or b"").decode(errors="ignore")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return " | ".join(lines[-n:]) if lines else "(пусто)"
+
+
 # --- FFMPEG: построение конвертаций ---
+
+def robust_input(src: str, **kwargs):
+    """Вход с повышенной устойчивостью к битым/необычным потокам (айфон HEVC/HDR, пересланные файлы)."""
+    return ffmpeg.input(src, err_detect="ignore_err",
+                        analyzeduration="100M", probesize="100M", **kwargs)
+
 
 # Квадратный кроп min(iw,ih); x — по горизонтали, y — по вертикали.
 CROP_POS = {
@@ -360,7 +377,7 @@ CROP_POS = {
 def build_video_note(src: str, dst: str, crop: str = "center"):
     has_audio = has_audio_stream(src)
     x, y = CROP_POS.get(crop, CROP_POS["center"])
-    inp = ffmpeg.input(src, t=LIMIT_VIDEO_NOTE)
+    inp = robust_input(src, t=LIMIT_VIDEO_NOTE)
     v = (inp["v:0"]
          .filter("crop", "min(iw,ih)", "min(iw,ih)", x, y)          # квадрат с выбранной областью
          .filter("scale", VIDEO_NOTE_SIZE, VIDEO_NOTE_SIZE, flags="lanczos"))
@@ -381,12 +398,12 @@ def build_video_note(src: str, dst: str, crop: str = "center"):
 
 
 def build_to_voice(src: str, dst: str):
-    inp = ffmpeg.input(src, t=LIMIT_AUDIO)
+    inp = robust_input(src, t=LIMIT_AUDIO)
     return ffmpeg.output(inp["a:0"], dst, acodec="libopus", format="ogg", map_metadata=-1)
 
 
 def build_extract_audio(src: str, dst: str):
-    inp = ffmpeg.input(src, t=LIMIT_AUDIO)
+    inp = robust_input(src, t=LIMIT_AUDIO)
     return ffmpeg.output(inp["a:0"], dst, acodec="libmp3lame", format="mp3",
                          map_metadata=-1, **{"b:a": "192k"})
 
@@ -394,7 +411,7 @@ def build_extract_audio(src: str, dst: str):
 def build_to_gif(src: str, dst: str, palette: str, start: float = 0.0, duration: float = LIMIT_GIF):
     scale_w = "if(gte(iw,ih),320,-2)"
     scale_h = "if(gte(iw,ih),-2,320)"
-    base = (ffmpeg.input(src, ss=start, t=duration)
+    base = (robust_input(src, ss=start, t=duration)
             .filter("fps", fps=15)
             .filter("scale", scale_w, scale_h))
     p1 = base.filter("palettegen").output(palette, format="image2")
@@ -404,7 +421,7 @@ def build_to_gif(src: str, dst: str, palette: str, start: float = 0.0, duration:
 
 
 async def run_ffmpeg(spec, prog: Optional[str] = None, timeout: int = CONVERSION_TIMEOUT):
-    """Запуск ffmpeg как асинхронного процесса с таймаутом и принудительным завершением."""
+    """Запуск ffmpeg как асинхронного процесса; убиваем процесс при таймауте и отмене."""
     if prog:
         spec = spec.global_args("-progress", prog, "-nostats")
     args = ffmpeg.compile(spec, overwrite_output=True)
@@ -413,7 +430,7 @@ async def run_ffmpeg(spec, prog: Optional[str] = None, timeout: int = CONVERSION
     )
     try:
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
+    except (asyncio.TimeoutError, asyncio.CancelledError):
         try:
             proc.kill()
         except ProcessLookupError:
@@ -449,6 +466,8 @@ async def send_result(bot, chat_id, mode, path, ext, reply_to):
 
 
 async def _safe_edit(msg, text):
+    if msg is None:
+        return
     try:
         await msg.edit_text(text)
     except Exception:
@@ -467,13 +486,13 @@ async def run_conversion(context, chat_id, reply_to, file_ref, file_type, mode,
     palette  = os.path.join(work_dir, "palette.png")
     prog     = os.path.join(work_dir, "progress.txt")
 
-    if status is None:
-        status = await context.bot.send_message(
-            chat_id, f"{cfg.status}…", reply_parameters=_reply_params(reply_to))
-    else:
-        await _safe_edit(status, f"{cfg.status}…")
-
     try:
+        if status is None:
+            status = await context.bot.send_message(
+                chat_id, f"{cfg.status}…", reply_parameters=_reply_params(reply_to))
+        else:
+            await _safe_edit(status, f"{cfg.status}…")
+
         tg_file = await file_ref.get_file()
         await tg_file.download_to_drive(
             src, read_timeout=180, write_timeout=180, connect_timeout=180)
@@ -518,13 +537,24 @@ async def run_conversion(context, chat_id, reply_to, file_ref, file_type, mode,
         except Exception:
             pass
 
+    except asyncio.CancelledError:
+        # пользователь нажал «Отмена» — ffmpeg уже убит в run_ffmpeg, убираем статус
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        raise
+    except Forbidden:
+        # бот заблокирован пользователем — помечаем и больше ничего не отправляем
+        context.user_data[BLOCKED_KEY] = True
+        logger.info("Бот заблокирован пользователем — останавливаю обработку и очередь.")
     except asyncio.TimeoutError:
         await _safe_edit(status, "❌ Обработка заняла слишком долго и была остановлена. Попробуйте файл покороче.")
     except BadRequest as e:
         text = "❌ Файл слишком большой." if "too big" in str(e).lower() else f"❌ Ошибка отправки: {e}"
         await _safe_edit(status, text)
     except ffmpeg.Error as e:
-        logger.error("ffmpeg error: %s", (e.stderr or b"").decode(errors="ignore")[-800:])
+        logger.error("ffmpeg error: %s", _tail(e.stderr))
         await _safe_edit(status, "❌ Ошибка обработки файла. Проверьте формат.")
     except Exception as e:
         logger.error("Conversion error: %s", e, exc_info=True)
@@ -535,20 +565,33 @@ async def run_conversion(context, chat_id, reply_to, file_ref, file_type, mode,
 
 async def process_now(context, chat_id, reply_to, file_ref, file_type, mode,
                       crop="center", gif_start=0.0, gif_duration=None):
-    """Очередь на пользователя + плашка «в очереди» + запуск конвертации."""
-    lock = context.user_data.get(LOCK_KEY)
+    """Очередь на пользователя + плашка «в очереди» + запуск конвертации + учёт задачи для отмены."""
+    ud = context.user_data
+    lock = ud.get(LOCK_KEY)
     if lock is None:
         lock = asyncio.Lock()
-        context.user_data[LOCK_KEY] = lock
+        ud[LOCK_KEY] = lock
 
-    status = None
-    if lock.locked():
-        status = await context.bot.send_message(
-            chat_id, "🕓 В очереди…", reply_parameters=_reply_params(reply_to))
+    tasks = ud.setdefault(TASKS_KEY, set())
+    task = asyncio.current_task()
+    tasks.add(task)
+    try:
+        status = None
+        if lock.locked():
+            try:
+                status = await context.bot.send_message(
+                    chat_id, "🕓 В очереди…", reply_parameters=_reply_params(reply_to))
+            except Forbidden:
+                ud[BLOCKED_KEY] = True
+                return
 
-    async with lock:
-        await run_conversion(context, chat_id, reply_to, file_ref, file_type, mode,
-                             status=status, crop=crop, gif_start=gif_start, gif_duration=gif_duration)
+        async with lock:
+            if ud.get(BLOCKED_KEY):
+                return                                   # пользователь заблокировал — не тратим ресурсы
+            await run_conversion(context, chat_id, reply_to, file_ref, file_type, mode,
+                                 status=status, crop=crop, gif_start=gif_start, gif_duration=gif_duration)
+    finally:
+        tasks.discard(task)
 
 
 # --- МЕНЮ И ВСПОМОГАТЕЛЬНОЕ ---
@@ -572,6 +615,11 @@ def set_mode(context, mode: int, crop: Optional[str] = None) -> None:
         context.user_data[CROP_KEY] = crop
 
 
+def clear_blocked(context) -> None:
+    """Раз пришло сообщение — пользователь нас не блокирует (Telegram бы его не доставил)."""
+    context.user_data.pop(BLOCKED_KEY, None)
+
+
 def confirm_text(mode: int, crop: Optional[str] = None) -> str:
     cfg = MODES[mode]
     if mode == MODE_VIDEO_NOTE and crop:
@@ -579,6 +627,14 @@ def confirm_text(mode: int, crop: Optional[str] = None) -> str:
     else:
         head = f"✅ Режим: {cfg.title}."
     return f"{head}\n{cfg.prompt}"
+
+
+def circle_entry_text(context) -> str:
+    crop = context.user_data.get(CROP_KEY)
+    if crop:
+        return (f"⭕ Кружок (сейчас кадр {CROP_LABELS[crop]}). Присылайте видео "
+                "или выберите другую часть кадра ниже.")
+    return "⭕ Кружок. Сначала выберите часть кадра ниже."
 
 
 async def prompt_send_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -593,6 +649,7 @@ async def prompt_send_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # --- ХЭНДЛЕРЫ ---
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    clear_blocked(context)
     context.user_data[MENU_KEY] = "root"
     await update.message.reply_text(
         "👋 Привет! Я делаю кружки и голосовые, извлекаю аудио и собираю GIF.\n"
@@ -604,12 +661,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def make_mode_command(mode: int):
     """Команды (/videonote и т.д.) — быстрый доступ к режиму."""
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        clear_blocked(context)
         chat = update.effective_chat
         if mode == MODE_VIDEO_NOTE:
-            crop = context.user_data.get(CROP_KEY, "center")
-            set_mode(context, mode, crop=crop)
+            context.user_data[STATE_KEY] = MODE_VIDEO_NOTE          # часть кадра не задаём — выберет сам
+            context.user_data[PENDING_KEY] = None
             context.user_data[MENU_KEY] = "crop"
-            await update.message.reply_text(with_group_note(confirm_text(mode, crop), chat), reply_markup=KB_CROP)
+            await update.message.reply_text(with_group_note(circle_entry_text(context), chat), reply_markup=KB_CROP)
         elif mode == MODE_TO_GIF:
             set_mode(context, mode)
             context.user_data[MENU_KEY] = "gif"
@@ -619,6 +677,18 @@ def make_mode_command(mode: int):
             context.user_data[MENU_KEY] = "audio"
             await update.message.reply_text(with_group_note(confirm_text(mode), chat), reply_markup=KB_AUDIO)
     return handler
+
+
+async def cancel_conversion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «Отмена»: убиваем активные конвертации пользователя (или сообщаем, что нечего отменять)."""
+    tasks = context.user_data.get(TASKS_KEY) or set()
+    active = [t for t in list(tasks) if not t.done()]
+    if not active:
+        await update.message.reply_text("Сейчас нечего отменять — конвертация не идёт.")
+        return
+    for t in active:
+        t.cancel()
+    await update.message.reply_text("❌ Останавливаю конвертацию…")
 
 
 async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
@@ -634,8 +704,9 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
         ud[MENU_KEY] = "audio"
         await update.message.reply_text("🎵 Аудио:", reply_markup=KB_AUDIO)
     elif text == BTN_CIRCLE:
+        ud[STATE_KEY] = MODE_VIDEO_NOTE                      # входим в режим кружка, кроп пока не задан
         ud[MENU_KEY] = "crop"
-        await update.message.reply_text("⭕ Кружок — какую часть кадра брать?", reply_markup=KB_CROP)
+        await update.message.reply_text(with_group_note(circle_entry_text(context), chat), reply_markup=KB_CROP)
     elif text in CROP_BUTTONS:
         crop = CROP_BUTTONS[text]
         set_mode(context, MODE_VIDEO_NOTE, crop=crop)
@@ -672,8 +743,14 @@ async def gif_from_pending(context, update, start, duration):
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    clear_blocked(context)
     text = (update.message.text or "").strip()
     ud = context.user_data
+
+    # Кнопка «Отмена» — отдельно (останавливает конвертацию)
+    if text == BTN_CANCEL:
+        await cancel_conversion(update, context)
+        return
 
     # Кнопка «Всё» — отдельно (использует отложенный файл)
     if text == BTN_ALL:
@@ -696,7 +773,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         seg = parse_interval(text)
         if seg is None:
             await update.message.reply_text(
-                f"Не понял время. Формат 0:05-0:25 (максимум {LIMIT_GIF} секунд) или нажмите «✅ Всё».")
+                f"Не понял время. Формат 0:05-0:25 или 5-25 (в секундах), "
+                f"максимум {LIMIT_GIF} секунд, либо нажмите «✅ Всё».")
             return
         start, end = seg
         if end - start > LIMIT_GIF:
@@ -711,9 +789,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    clear_blocked(context)
     if context.user_data.get(PENDING_KEY):
         await update.message.reply_text(
-            f"✂️ Жду время для GIF (0:05-0:25, максимум {LIMIT_GIF} секунд) или нажмите «✅ Всё».")
+            f"✂️ Жду время для GIF (0:05-0:25 или 5-25, максимум {LIMIT_GIF} секунд) или нажмите «✅ Всё».")
         return
     await prompt_send_file(update, context)
 
@@ -757,11 +836,12 @@ async def handle_gif_media(update: Update, context: ContextTypes.DEFAULT_TYPE, f
     ud[GROUP_KEY] = None
     await message.reply_text(
         "✂️ На какой отрезок делать GIF?\n"
-        f"Пришлите время в формате 0:05-0:25 (максимум {LIMIT_GIF} секунд) "
+        f"Пришлите время в формате 0:05-0:25 или 5-25 (в секундах), максимум {LIMIT_GIF} секунд, "
         "или нажмите «✅ Всё» — возьму первые 30 секунд.", do_quote=True)
 
 
 async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    clear_blocked(context)
     message = update.message
     chat = message.chat
     file_ref, file_type = pick_file(message)
@@ -793,11 +873,22 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await handle_gif_media(update, context, file_ref, file_type)
         return
 
-    crop = context.user_data.get(CROP_KEY, "center")
-    await process_now(context, chat.id, message.message_id, file_ref, file_type, mode, crop=crop)
+    if mode == MODE_VIDEO_NOTE:
+        crop = context.user_data.get(CROP_KEY)
+        if crop is None:
+            context.user_data[MENU_KEY] = "crop"
+            await message.reply_text(
+                "⚠️ Сначала выберите часть кадра для кружка (кнопки ниже).",
+                reply_markup=KB_CROP, do_quote=True)
+            return
+        await process_now(context, chat.id, message.message_id, file_ref, file_type, mode, crop=crop)
+        return
+
+    await process_now(context, chat.id, message.message_id, file_ref, file_type, mode)
 
 
 async def on_unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    clear_blocked(context)
     await update.message.reply_text("Неизвестная команда. Откройте меню кнопками ниже или /start.")
 
 
