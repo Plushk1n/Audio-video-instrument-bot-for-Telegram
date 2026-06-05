@@ -5,9 +5,9 @@ Telegram-бот для конвертации медиа:
   • видео/кружок → извлечение аудио (mp3)
   • видео/кружок → GIF (с выбором временного отрезка, по одному файлу за раз)
 
-Версия 2.2.0 — кнопка «Отмена» в каждом меню (убивает текущую конвертацию), обязательный
-выбор части кадра для кружка, остановка всей работы при блокировке бота пользователем,
-повышенная устойчивость к «битым»/необычным потокам и понятное логирование ошибок ffmpeg.
+Версия 2.2.1 — кнопка «Назад» сбрасывает выбранный режим; извлечение аудио работает и с
+голосовыми сообщениями (→ mp3); возврат на системный ffmpeg (Debian) — он корректно
+обрабатывает Dolby Vision MOV, на котором падала статическая сборка; код возврата ffmpeg в логах.
 """
 
 import asyncio
@@ -128,14 +128,14 @@ MODES: "dict[int, Mode]" = {
     MODE_EXTRACT_AUDIO: Mode(
         command="extractaudio",
         title="извлечение аудио",
-        prompt="🎶 Пришлите видео или кружок — можно несколько подряд.",
+        prompt="🎶 Пришлите видео, кружок или голосовое — можно несколько подряд.",
         status="🎶 Извлекаю аудио",
         output_ext=".mp3",
         limit=LIMIT_AUDIO,
-        valid_types=frozenset({"video", "video_note"}),
-        error="❌ Для извлечения аудио нужно видео или кружок — отправьте подходящий файл.",
-        same_types=frozenset({"audio", "voice", "audio_doc"}),
-        same_type_error="🔁 Это уже аудио — извлекать не нужно.",
+        valid_types=frozenset({"video", "video_note", "voice"}),
+        error="❌ Для извлечения аудио нужно видео, кружок или голосовое — отправьте подходящий файл.",
+        same_types=frozenset({"audio", "audio_doc"}),
+        same_type_error="🔁 Это уже аудиофайл — извлекать не нужно.",
     ),
     MODE_TO_GIF: Mode(
         command="togif",
@@ -359,9 +359,8 @@ def _tail(stderr_bytes, n: int = 6) -> str:
 # --- FFMPEG: построение конвертаций ---
 
 def robust_input(src: str, **kwargs):
-    """Вход с повышенной устойчивостью к битым/необычным потокам (айфон HEVC/HDR, пересланные файлы)."""
-    return ffmpeg.input(src, err_detect="ignore_err",
-                        analyzeduration="100M", probesize="100M", **kwargs)
+    """Вход с мягкой устойчивостью к слегка битым/необычным потокам (например, пересланным)."""
+    return ffmpeg.input(src, err_detect="ignore_err", **kwargs)
 
 
 # Квадратный кроп min(iw,ih); x — по горизонтали, y — по вертикали.
@@ -438,7 +437,9 @@ async def run_ffmpeg(spec, prog: Optional[str] = None, timeout: int = CONVERSION
         await proc.wait()
         raise
     if proc.returncode:
-        raise ffmpeg.Error("ffmpeg", b"", stderr or b"")
+        err = ffmpeg.Error("ffmpeg", b"", stderr or b"")
+        err.returncode = proc.returncode          # -9 = убит по памяти, -11 = краш, >0 = ошибка ffmpeg
+        raise err
     return stderr
 
 
@@ -554,7 +555,7 @@ async def run_conversion(context, chat_id, reply_to, file_ref, file_type, mode,
         text = "❌ Файл слишком большой." if "too big" in str(e).lower() else f"❌ Ошибка отправки: {e}"
         await _safe_edit(status, text)
     except ffmpeg.Error as e:
-        logger.error("ffmpeg error: %s", _tail(e.stderr))
+        logger.error("ffmpeg error (rc=%s): %s", getattr(e, "returncode", "?"), _tail(e.stderr))
         await _safe_edit(status, "❌ Ошибка обработки файла. Проверьте формат.")
     except Exception as e:
         logger.error("Conversion error: %s", e, exc_info=True)
@@ -698,9 +699,11 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
     chat = update.effective_chat
 
     if text == BTN_VIDEO:
+        ud[STATE_KEY] = None
         ud[MENU_KEY] = "video"
         await update.message.reply_text("🎬 Видео:", reply_markup=KB_VIDEO)
     elif text == BTN_AUDIO:
+        ud[STATE_KEY] = None
         ud[MENU_KEY] = "audio"
         await update.message.reply_text("🎵 Аудио:", reply_markup=KB_AUDIO)
     elif text == BTN_CIRCLE:
@@ -727,7 +730,9 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
     elif text == BTN_BACK:
         target = BACK_TARGET.get(ud.get(MENU_KEY), "root")
         ud[MENU_KEY] = target
-        titles = {"root": "Что делаем?", "video": "🎬 Видео:", "audio": "🎵 Аудио:"}
+        ud[STATE_KEY] = None                              # «Назад» сбрасывает выбранный режим
+        titles = {"root": "Что делаем? Сначала выберите режим ниже.",
+                  "video": "🎬 Видео:", "audio": "🎵 Аудио:"}
         await update.message.reply_text(titles.get(target, "Что делаем?"), reply_markup=LEVEL_KB[target])
 
 
