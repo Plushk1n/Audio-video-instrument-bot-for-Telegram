@@ -5,9 +5,9 @@ Telegram-бот для конвертации медиа (лайт-версия,
   • видео/ГС    → извлечение аудио (mp3)
   • видео       → GIF (первые 30 секунд)
 
-Версия 1.1.0 — бот всегда отвечает на файл (reply), кнопка «Отмена» останавливает текущую
-конвертацию, при блокировке пользователем работа прекращается, корректные сообщения о размере
-и неподходящем формате, а GIF/ГС больше не пытаются обрабатывать неподходящие файлы.
+Версия 1.1.1 — декод ffmpeg в один поток (тяжёлые видео с айфона больше не падают по памяти);
+блокировка бота мгновенно гасит все процессы пользователя (а не доезжает в фоне); большой GIF
+в режиме GIF сообщает «уже GIF»; извлечение аудио отвечает «уже аудио» на любые аудиофайлы (кроме ГС).
 """
 
 import asyncio
@@ -86,8 +86,8 @@ class Mode:
     limit: int                                   # потолок длительности (для прогресса)
     valid_types: frozenset = field(default_factory=frozenset)
     error: str = "❌ Неподходящий файл."
-    same_type: Optional[str] = None              # тип входа, который уже является результатом
-    same_type_error: str = ""                    # сообщение для случая «уже такой формат»
+    same_types: frozenset = field(default_factory=frozenset)   # типы входа, которые уже являются результатом
+    same_type_error: str = ""                                  # сообщение для случая «уже такой формат»
 
 
 MODES: dict[int, Mode] = {
@@ -101,7 +101,7 @@ MODES: dict[int, Mode] = {
         limit=LIMIT_VIDEO_NOTE,
         valid_types=frozenset({"video", "video_note", "animation"}),
         error="❌ Для кружка нужно видео или GIF — отправьте подходящий файл.",
-        same_type="video_note",
+        same_types=frozenset({"video_note"}),
         same_type_error="🔁 Это уже кружок — конвертировать не нужно.",
     ),
     MODE_TO_VOICE: Mode(
@@ -113,7 +113,7 @@ MODES: dict[int, Mode] = {
         limit=LIMIT_AUDIO,
         valid_types=frozenset({"audio", "video", "video_note", "audio_doc"}),
         error="❌ Для голосового нужно аудио или видео — отправьте подходящий файл.",
-        same_type="voice",
+        same_types=frozenset({"voice"}),
         same_type_error="🔁 Это уже голосовое сообщение.",
     ),
     MODE_EXTRACT_AUDIO: Mode(
@@ -125,6 +125,8 @@ MODES: dict[int, Mode] = {
         limit=LIMIT_AUDIO,
         valid_types=frozenset({"video", "video_note", "voice"}),
         error="❌ Для извлечения аудио нужно видео или голосовое — отправьте подходящий файл.",
+        same_types=frozenset({"audio", "audio_doc"}),
+        same_type_error="🔁 Это уже аудиофайл — извлекать не нужно.",
     ),
     MODE_TO_GIF: Mode(
         command="togif",
@@ -136,7 +138,7 @@ MODES: dict[int, Mode] = {
         limit=LIMIT_GIF,
         valid_types=frozenset({"video", "video_note", "animation"}),
         error="❌ Для GIF нужно видео — отправьте подходящий файл.",
-        same_type="animation",
+        same_types=frozenset({"animation"}),
         same_type_error="🔁 Это уже GIF.",
     ),
 }
@@ -270,9 +272,27 @@ def format_eta(seconds: float) -> str:
     return f"~{m} мин {s} с"
 
 
+def _cancel_user_tasks(context) -> int:
+    """Отменяет все активные задачи конвертации пользователя; возвращает их количество."""
+    active = [t for t in list(context.user_data.get(TASKS_KEY) or set()) if not t.done()]
+    for t in active:
+        t.cancel()
+    return len(active)
+
+
+def cancel_all_user_tasks(context) -> None:
+    """Пользователь заблокировал бота: помечаем это и гасим все его задачи (текущую и очередь)."""
+    context.user_data[BLOCKED_KEY] = True
+    _cancel_user_tasks(context)
+
+
 async def progress_loop(status_msg, base: str, path: str, total: float,
-                        stop: asyncio.Event, start: float):
-    """Периодически обновляет статусное сообщение прогрессом и ETA, пока stop не выставлен."""
+                        stop: asyncio.Event, start: float, context):
+    """Периодически обновляет статусное сообщение прогрессом и ETA, пока stop не выставлен.
+
+    Если обновление падает с Forbidden — значит, пользователь заблокировал бота прямо во время
+    конвертации. Тогда сразу гасим ВСЕ его задачи (текущую и очередь), чтобы ffmpeg не молотил впустую.
+    """
     last_text = None
     while not stop.is_set():
         try:
@@ -292,6 +312,9 @@ async def progress_loop(status_msg, base: str, path: str, total: float,
             last_text = line
             try:
                 await status_msg.edit_text(line)
+            except Forbidden:
+                cancel_all_user_tasks(context)      # пользователь заблокировал бота — гасим всё
+                return
             except Exception:
                 pass                                 # "not modified", флуд-лимит и т.п. — игнорируем
 
@@ -305,6 +328,14 @@ def _tail(stderr_bytes, n: int = 6) -> str:
 
 # --- FFMPEG ---
 
+def _input(src: str, **kwargs):
+    """Вход с декодом в 1 поток — экономия памяти на контейнере (защита от OOM на тяжёлых HEVC/HDR-видео).
+
+    Число потоков влияет только на память и скорость декода, но не на качество результата.
+    """
+    return ffmpeg.input(src, threads=1, **kwargs)
+
+
 def build_video_note(src: str, dst: str):
     probe = ffmpeg.probe(src)
     streams = probe.get("streams", [])
@@ -314,7 +345,7 @@ def build_video_note(src: str, dst: str):
         raise ValueError("Видеопоток не найден.")
 
     side = min(int(video.get("width", VIDEO_NOTE_SIZE)), int(video.get("height", VIDEO_NOTE_SIZE)))
-    inp = ffmpeg.input(src, t=LIMIT_VIDEO_NOTE)
+    inp = _input(src, t=LIMIT_VIDEO_NOTE)
     v = (inp["v:0"]
          .filter("crop", side, side)
          .filter("scale", VIDEO_NOTE_SIZE, VIDEO_NOTE_SIZE, flags="lanczos"))
@@ -335,7 +366,7 @@ def build_video_note(src: str, dst: str):
 
 def build_to_voice(src: str, dst: str):
     return ffmpeg.output(
-        ffmpeg.input(src, t=LIMIT_AUDIO),
+        _input(src, t=LIMIT_AUDIO),
         dst,
         vn=None,
         acodec="libopus",
@@ -346,7 +377,7 @@ def build_to_voice(src: str, dst: str):
 
 def build_extract_audio(src: str, dst: str):
     return ffmpeg.output(
-        ffmpeg.input(src, t=LIMIT_AUDIO),
+        _input(src, t=LIMIT_AUDIO),
         dst,
         vn=None,
         acodec="libmp3lame",
@@ -359,7 +390,7 @@ def build_to_gif(src: str, dst: str, palette: str):
     scale_w = "if(gte(iw,ih),320,-2)"
     scale_h = "if(gte(iw,ih),-2,320)"
     base = (
-        ffmpeg.input(src, t=LIMIT_GIF)
+        _input(src, t=LIMIT_GIF)
         .filter("fps", fps=15)
         .filter("scale", scale_w, scale_h)
     )
@@ -462,7 +493,7 @@ async def run_conversion(update, context, file_ref, mode, file_type, reply_to, s
         async with ffmpeg_semaphore():
             stop = asyncio.Event()
             start = time.monotonic()                       # отсчёт для ETA — с момента старта ffmpeg
-            updater = asyncio.create_task(progress_loop(status, cfg.status, prog, total, stop, start))
+            updater = asyncio.create_task(progress_loop(status, cfg.status, prog, total, stop, start, context))
             try:
                 if mode == MODE_VIDEO_NOTE:
                     await run_ffmpeg(build_video_note(src, dst), prog)
@@ -533,15 +564,11 @@ async def clear_blocked_pre(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def cancel_conversion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Кнопка «Отмена»: убиваем активные конвертации пользователя (или сообщаем, что нечего отменять)."""
-    tasks = context.user_data.get(TASKS_KEY) or set()
-    active = [t for t in list(tasks) if not t.done()]
-    if not active:
+    """Кнопка «Отмена»: гасим активные конвертации пользователя (или сообщаем, что нечего отменять)."""
+    if _cancel_user_tasks(context):
+        await update.message.reply_text("❌ Останавливаю конвертацию…")
+    else:
         await update.message.reply_text("Сейчас нечего отменять — конвертация не идёт.")
-        return
-    for t in active:
-        t.cancel()
-    await update.message.reply_text("❌ Останавливаю конвертацию…")
 
 
 async def prompt_send_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -594,20 +621,18 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     cfg = MODES[mode]
-    # Файл «понятен» режиму, если он подходит для обработки ИЛИ уже является результатом.
-    recognized = file_type in cfg.valid_types or file_type == cfg.same_type
-    if not recognized:
+    # Уже готовый результат (GIF в режиме GIF, аудиофайл в извлечении и т.п.) — сообщаем и выходим.
+    if file_type in cfg.same_types:
+        await message.reply_text(cfg.same_type_error, do_quote=True)
+        return
+    # Неподходящий формат (например, GIF в режиме голосового или извлечения).
+    if file_type not in cfg.valid_types:
         await message.reply_text(cfg.error, do_quote=True)
         return
-
-    # Размер проверяем раньше «уже такой формат» — чтобы большой GIF сообщал о лимите, а не «уже GIF».
+    # Слишком большой для скачивания ботом.
     size = getattr(file_ref, "file_size", None) or 0
     if size > MAX_DOWNLOAD_SIZE:
         await message.reply_text("❌ Файл слишком большой — Telegram позволяет боту скачивать до 20 МБ.", do_quote=True)
-        return
-
-    if file_type == cfg.same_type:
-        await message.reply_text(cfg.same_type_error, do_quote=True)
         return
 
     # Липкий режим: STATE_KEY НЕ сбрасываем — пользователь может слать файлы подряд.
