@@ -5,9 +5,9 @@ Telegram-бот для конвертации медиа:
   • видео/кружок → извлечение аудио (mp3)
   • видео/кружок → GIF (с выбором временного отрезка, по одному файлу за раз)
 
-Версия 2.2.2 — декодирование ffmpeg в один поток: тяжёлые видео с айфона (HEVC 10-бит, HDR,
-Dolby Vision) больше не упираются в память контейнера и не падают по OOM (rc=-9). Качество
-результата не меняется — число потоков влияет только на память и скорость декода.
+Версия 2.2.3 — блокировка бота пользователем мгновенно гасит все его процессы (текущую
+конвертацию и очередь), а не доделывает их в фоне. Плюс всё из 2.2.2: декод ffmpeg в один
+поток, чтобы тяжёлые видео с айфона (HEVC 10-бит, HDR, Dolby Vision) не падали по нехватке памяти.
 """
 
 import asyncio
@@ -324,8 +324,22 @@ def format_eta(seconds: float) -> str:
     return f"~{m} мин {s} с"
 
 
+def _cancel_user_tasks(context) -> int:
+    """Отменяет все активные задачи конвертации пользователя; возвращает их количество."""
+    active = [t for t in list(context.user_data.get(TASKS_KEY) or set()) if not t.done()]
+    for t in active:
+        t.cancel()
+    return len(active)
+
+
+def cancel_all_user_tasks(context) -> None:
+    """Пользователь заблокировал бота: помечаем это и гасим все его задачи (текущую и очередь)."""
+    context.user_data[BLOCKED_KEY] = True
+    _cancel_user_tasks(context)
+
+
 async def progress_loop(status_msg, base: str, path: str, total: float,
-                        stop: asyncio.Event, start: float):
+                        stop: asyncio.Event, start: float, context):
     last_text = None
     while not stop.is_set():
         try:
@@ -345,6 +359,9 @@ async def progress_loop(status_msg, base: str, path: str, total: float,
             last_text = line
             try:
                 await status_msg.edit_text(line)
+            except Forbidden:
+                cancel_all_user_tasks(context)      # пользователь заблокировал бота — гасим всё
+                return
             except Exception:
                 pass
 
@@ -522,7 +539,7 @@ async def run_conversion(context, chat_id, reply_to, file_ref, file_type, mode,
         async with ffmpeg_semaphore():
             stop = asyncio.Event()
             start = time.monotonic()
-            updater = asyncio.create_task(progress_loop(status, cfg.status, prog, total, stop, start))
+            updater = asyncio.create_task(progress_loop(status, cfg.status, prog, total, stop, start, context))
             try:
                 if mode == MODE_VIDEO_NOTE:
                     await run_ffmpeg(build_video_note(src, dst, crop), prog)
@@ -687,15 +704,11 @@ def make_mode_command(mode: int):
 
 
 async def cancel_conversion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Кнопка «Отмена»: убиваем активные конвертации пользователя (или сообщаем, что нечего отменять)."""
-    tasks = context.user_data.get(TASKS_KEY) or set()
-    active = [t for t in list(tasks) if not t.done()]
-    if not active:
+    """Кнопка «Отмена»: гасим активные конвертации пользователя (или сообщаем, что нечего отменять)."""
+    if _cancel_user_tasks(context):
+        await update.message.reply_text("❌ Останавливаю конвертацию…")
+    else:
         await update.message.reply_text("Сейчас нечего отменять — конвертация не идёт.")
-        return
-    for t in active:
-        t.cancel()
-    await update.message.reply_text("❌ Останавливаю конвертацию…")
 
 
 async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
