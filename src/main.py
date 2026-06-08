@@ -5,9 +5,9 @@ Telegram-бот для конвертации медиа (лайт-версия,
   • видео/ГС    → извлечение аудио (mp3)
   • видео       → GIF (первые 30 секунд)
 
-Версия 1.1.1 — декод ffmpeg в один поток (тяжёлые видео с айфона больше не падают по памяти);
-блокировка бота мгновенно гасит все процессы пользователя (а не доезжает в фоне); большой GIF
-в режиме GIF сообщает «уже GIF»; извлечение аудио отвечает «уже аудио» на любые аудиофайлы (кроме ГС).
+Версия 1.1.2 — исправлена работа в группах: там бот управляется командами (/videonote, /tovoice,
+/extractaudio, /togif, /cancel) без нерабочих кнопок-меню, кружок делается по центру, GIF берёт первые
+30 секунд. В личных сообщениях всё работает по-прежнему.
 """
 
 import asyncio
@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 import ffmpeg
-from telegram import Update, ReplyKeyboardMarkup, InputFile, ReplyParameters
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InputFile, ReplyParameters
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -549,6 +549,20 @@ GROUP_REPLY_NOTE = (
     "иначе из-за настроек приватности бот его не получит."
 )
 
+GROUP_HELP = (
+    "👋 Привет! В группе я работаю по командам (кнопок-меню тут нет):\n"
+    "• /videonote — видеокружок (по центру)\n"
+    "• /tovoice — в голосовое\n"
+    "• /extractaudio — извлечь аудио\n"
+    "• /togif — в GIF (первые 30 секунд)\n"
+    "• /cancel — отменить конвертацию\n\n"
+    "Выберите команду и пришлите файл ответом (reply) на моё сообщение."
+)
+
+
+def is_group(chat) -> bool:
+    return chat.type in ("group", "supergroup")
+
 
 def with_group_note(text: str, chat) -> str:
     """В группе добавляет примечание: файл нужно слать ответом на сообщение бота."""
@@ -580,9 +594,12 @@ async def prompt_send_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if is_group(update.effective_chat):
+        await update.message.reply_text(GROUP_HELP, reply_markup=ReplyKeyboardRemove())
+        return
     text = "👋 Привет! Выберите действие и отправляйте файлы — можно несколько подряд."
     await update.message.reply_text(
-        with_group_note(text, update.effective_chat),
+        text,
         reply_markup=ReplyKeyboardMarkup(KEYBOARD, resize_keyboard=True),
     )
 
@@ -590,7 +607,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def make_mode_command(mode: int):
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data[STATE_KEY] = mode
-        await update.message.reply_text(with_group_note(MODES[mode].prompt, update.effective_chat))
+        chat = update.effective_chat
+        # В группе убираем любые кнопки (их там нет), в личке клавиатуру не трогаем.
+        markup = ReplyKeyboardRemove() if is_group(chat) else None
+        await update.message.reply_text(with_group_note(MODES[mode].prompt, chat), reply_markup=markup)
     return handler
 
 
@@ -702,6 +722,7 @@ def main():
     app.add_handler(TypeHandler(Update, clear_blocked_pre), group=-1)
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("cancel", cancel_conversion))
     for mode_id, cfg in MODES.items():
         app.add_handler(CommandHandler(cfg.command, make_mode_command(mode_id)))
 
