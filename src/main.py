@@ -5,9 +5,9 @@ Telegram-бот для конвертации медиа:
   • видео/кружок → извлечение аудио (mp3)
   • видео/кружок → GIF (с выбором временного отрезка, по одному файлу за раз)
 
-Версия 2.2.3 — блокировка бота пользователем мгновенно гасит все его процессы (текущую
-конвертацию и очередь), а не доделывает их в фоне. Плюс всё из 2.2.2: декод ffmpeg в один
-поток, чтобы тяжёлые видео с айфона (HEVC 10-бит, HDR, Dolby Vision) не падали по нехватке памяти.
+Версия 2.2.4 — исправлена работа в группах: там бот управляется командами (/videonote, /tovoice,
+/extractaudio, /togif, /cancel) без нерабочих кнопок-меню, кружок делается по центру, GIF берёт
+первые 30 секунд. В личных сообщениях всё работает по-прежнему.
 """
 
 import asyncio
@@ -26,6 +26,7 @@ from telegram import (
     Update,
     InputFile,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     ReplyParameters,
 )
 from telegram.ext import (
@@ -632,6 +633,28 @@ def with_group_note(text: str, chat) -> str:
     return text
 
 
+def is_group(chat) -> bool:
+    return chat.type in ("group", "supergroup")
+
+
+GROUP_HELP = (
+    "👋 Привет! В группе я работаю по командам (кнопок-меню тут нет):\n"
+    "• /videonote — видеокружок (по центру)\n"
+    "• /tovoice — в голосовое\n"
+    "• /extractaudio — извлечь аудио\n"
+    "• /togif — в GIF (первые 30 секунд)\n"
+    "• /cancel — отменить конвертацию\n\n"
+    "Выберите команду и пришлите файл ответом (reply) на моё сообщение."
+)
+
+GROUP_MODE_HINT = {
+    MODE_VIDEO_NOTE: "⭕ Режим: видеокружок (по центру). Пришлите видео или GIF.",
+    MODE_TO_VOICE: "🎵 Режим: в голосовое. Пришлите аудио или видео.",
+    MODE_EXTRACT_AUDIO: "🎶 Режим: извлечь аудио. Пришлите видео или голосовое.",
+    MODE_TO_GIF: "🖼️ Режим: GIF (первые 30 секунд). Пришлите видео.",
+}
+
+
 def set_mode(context, mode: int, crop: Optional[str] = None) -> None:
     context.user_data[STATE_KEY] = mode
     context.user_data[PENDING_KEY] = None
@@ -674,6 +697,9 @@ async def prompt_send_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     clear_blocked(context)
+    if is_group(update.effective_chat):
+        await update.message.reply_text(GROUP_HELP, reply_markup=ReplyKeyboardRemove())
+        return
     context.user_data[MENU_KEY] = "root"
     await update.message.reply_text(
         "👋 Привет! Я делаю кружки и голосовые, извлекаю аудио и собираю GIF.\n"
@@ -687,6 +713,13 @@ def make_mode_command(mode: int):
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         clear_blocked(context)
         chat = update.effective_chat
+        if is_group(chat):
+            # В группе кнопок нет: кружок — по центру, GIF — первые 30 секунд (без пошагового выбора).
+            set_mode(context, mode, crop="center" if mode == MODE_VIDEO_NOTE else None)
+            await update.message.reply_text(
+                with_group_note(GROUP_MODE_HINT[mode], chat),
+                reply_markup=ReplyKeyboardRemove())
+            return
         if mode == MODE_VIDEO_NOTE:
             context.user_data[STATE_KEY] = MODE_VIDEO_NOTE          # часть кадра не задаём — выберет сам
             context.user_data[PENDING_KEY] = None
@@ -900,11 +933,14 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if mode == MODE_VIDEO_NOTE:
         crop = context.user_data.get(CROP_KEY)
         if crop is None:
-            context.user_data[MENU_KEY] = "crop"
-            await message.reply_text(
-                "⚠️ Сначала выберите часть кадра для кружка (кнопки ниже).",
-                reply_markup=KB_CROP, do_quote=True)
-            return
+            if is_group(chat):
+                crop = "center"                              # в группе кружок всегда по центру
+            else:
+                context.user_data[MENU_KEY] = "crop"
+                await message.reply_text(
+                    "⚠️ Сначала выберите часть кадра для кружка (кнопки ниже).",
+                    reply_markup=KB_CROP, do_quote=True)
+                return
         await process_now(context, chat.id, message.message_id, file_ref, file_type, mode, crop=crop)
         return
 
@@ -925,6 +961,7 @@ def main() -> None:
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("cancel", cancel_conversion))
     for mode_id, cfg in MODES.items():
         app.add_handler(CommandHandler(cfg.command, make_mode_command(mode_id)))
 
